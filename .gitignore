@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+flowpilot.db
+flowpilot.db-wal
+flowpilot.db-shm
+evidence/
