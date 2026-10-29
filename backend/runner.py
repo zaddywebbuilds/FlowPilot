@@ -84,7 +84,9 @@ async def launch_browser(pw, preferred, headless):
         except Exception as exc:
             errors.append(f"{channel or 'bundled chromium'}: {str(exc).splitlines()[0]}")
     raise RuntimeError(
-        "No usable browser found. Tried " + "; ".join(errors)
+        "No usable browser found. Install Google Chrome or Microsoft Edge, or run "
+        "'playwright install chromium' to fetch the bundled one. Tried "
+        + "; ".join(errors)
     )
 
 

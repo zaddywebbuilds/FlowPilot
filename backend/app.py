@@ -6,11 +6,12 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import auth
 import db
 from runner import AuthorizationError, engine
 
@@ -101,6 +102,106 @@ class SettingsPayload(BaseModel):
 
 class ResolvePayload(BaseModel):
     resolution: str  # approve | reject
+
+
+class PasswordPayload(BaseModel):
+    password: str
+
+
+# -- authentication ----------------------------------------------------------
+
+PUBLIC_PATHS = {
+    "/login",
+    "/login.html",
+    "/login.js",
+    "/styles.css",
+    "/api/auth/status",
+    "/api/auth/setup",
+    "/api/auth/login",
+}
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    path = request.url.path
+    if path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    # Until a password exists nothing else is reachable, so an instance that is
+    # deployed but not yet set up is never left open.
+    if not auth.is_configured():
+        if path.startswith("/api/") or path == "/ws":
+            return JSONResponse({"detail": "Setup required."}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
+
+    if auth.validate_token(request.cookies.get(auth.COOKIE_NAME)):
+        return await call_next(request)
+
+    if path.startswith("/api/") or path == "/ws":
+        return JSONResponse({"detail": "Not authenticated."}, status_code=401)
+    return RedirectResponse("/login", status_code=303)
+
+
+def _issue_cookie(response: Response, request: Request, label: str) -> None:
+    token, max_age = auth.create_session(label)
+    response.set_cookie(
+        auth.COOKIE_NAME, token,
+        max_age=max_age, httponly=True, samesite="lax",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    return {
+        "configured": auth.is_configured(),
+        "authenticated": auth.validate_token(request.cookies.get(auth.COOKIE_NAME)),
+    }
+
+
+@app.post("/api/auth/setup")
+def auth_setup(payload: PasswordPayload, request: Request):
+    if auth.is_configured():
+        raise HTTPException(400, "A password is already set.")
+    try:
+        auth.set_password(payload.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    response = JSONResponse({"ok": True})
+    _issue_cookie(response, request, "setup")
+    return response
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: PasswordPayload, request: Request):
+    if not auth.is_configured():
+        raise HTTPException(400, "No password has been set yet.")
+    if not auth.verify_password(payload.password):
+        raise HTTPException(401, "Incorrect password.")
+    response = JSONResponse({"ok": True})
+    _issue_cookie(response, request, "login")
+    return response
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
+    auth.destroy_session(request.cookies.get(auth.COOKIE_NAME))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return response
+
+
+@app.post("/api/auth/password")
+def auth_change_password(payload: PasswordPayload, request: Request):
+    """Changing the password invalidates every session, including this one."""
+    try:
+        auth.set_password(payload.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    response = JSONResponse({"ok": True})
+    _issue_cookie(response, request, "password change")
+    return response
 
 
 # -- overview ----------------------------------------------------------------
@@ -347,6 +448,10 @@ def put_settings(payload: SettingsPayload):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # HTTP middleware does not run for websocket scopes, so check the cookie here.
+    if auth.is_configured() and not auth.validate_token(ws.cookies.get(auth.COOKIE_NAME)):
+        await ws.close(code=1008)
+        return
     await ws.accept()
     queue: asyncio.Queue = asyncio.Queue(maxsize=500)
     engine.subscribe(queue)
@@ -381,14 +486,24 @@ db.EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/evidence", StaticFiles(directory=str(db.EVIDENCE_DIR)), name="evidence")
 
 
+def _render(filename: str) -> HTMLResponse:
+    """Stamp each asset URL with its file mtime so an update always busts the cache."""
+    html = (FRONTEND / filename).read_text(encoding="utf-8")
+    for asset in ("app.js", "styles.css", "login.js"):
+        path = FRONTEND / asset
+        if path.exists():
+            html = html.replace(f'"/{asset}"', f'"/{asset}?v={int(path.stat().st_mtime)}"')
+    return HTMLResponse(html)
+
+
 @app.get("/")
 def index():
-    """Stamp each asset URL with its file mtime so an update always busts the cache."""
-    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
-    for asset in ("app.js", "styles.css"):
-        version = int((FRONTEND / asset).stat().st_mtime)
-        html = html.replace(f'"/{asset}"', f'"/{asset}?v={version}"')
-    return HTMLResponse(html)
+    return _render("index.html")
+
+
+@app.get("/login")
+def login_page():
+    return _render("login.html")
 
 
 app.mount("/", StaticFiles(directory=str(FRONTEND)), name="frontend")

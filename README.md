@@ -30,19 +30,27 @@ terms permit automated access.
 
 ## Run it
 
-Double-click `run.bat`. First launch creates a virtual environment, installs
-dependencies, downloads Chromium and opens http://127.0.0.1:8000.
+Double-click `run.bat`. It checks for Python, sets up a virtual environment, installs
+dependencies and opens http://127.0.0.1:8000. First launch takes about a minute.
+
+It drives the Chrome or Edge already installed on the machine, so there is no large
+browser download. If you want Playwright's bundled Chromium as well, run
+`.venv\Scripts\python -m playwright install chromium` (note it needs the Microsoft
+Visual C++ runtime, which is missing on some clean Windows installs).
 
 Manual equivalent:
 
 ```bash
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python -m playwright install chromium
 .venv\Scripts\python -m uvicorn app:app --app-dir backend --port 8000
 ```
 
 ## First run
+
+You are asked to create a password. That password protects the dashboard, and
+nothing else is reachable until it is set, so an instance left running is never open.
+Change it later under Settings, which signs out every other device.
 
 A demo workflow against `quotes.toscrape.com` (a site published for automation
 practice) is seeded with five records. Open Overview and press **Start new run** to
@@ -59,19 +67,26 @@ python3 -m venv .venv
 .venv/bin/uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000
 ```
 
-Set **Browser** to "Playwright bundled Chromium" and turn **Run headless** on in Settings,
-since a server has no desktop. Put it under systemd so it survives a reboot.
+On a server you need the bundled Chromium, since there is no installed Chrome and no
+desktop: run `.venv/bin/playwright install --with-deps chromium`, then set **Browser**
+to "Playwright bundled Chromium" and turn **Run headless** on in Settings. Put it under
+systemd so it survives a reboot.
 
-**Do not expose port 8000 to the internet.** There is no login screen: the app binds to
-127.0.0.1 because it was built to be reached from the same machine. Anyone who can open
-the port can start runs and read your data. Reach it over an SSH tunnel:
+**Put TLS in front of it before exposing the port.** The dashboard has a password, and
+nothing is reachable until that password is set, but plain HTTP sends it in cleartext
+and anyone on the network path can read it. Two options:
+
+*Private, no certificate needed.* Keep it bound to 127.0.0.1 and tunnel in:
 
 ```bash
 ssh -L 8000:127.0.0.1:8000 you@your-vps
 ```
 
-Then browse to http://127.0.0.1:8000 on your own machine. If you need it reachable
-without a tunnel, put a reverse proxy with authentication in front of it first.
+Then browse to http://127.0.0.1:8000 on your own machine.
+
+*Shared with someone else.* Put Caddy or nginx in front with a real certificate, proxy
+to 127.0.0.1:8000, and leave port 8000 itself closed in the firewall. The session cookie
+sets its Secure flag automatically once requests arrive over HTTPS.
 
 ## Screens
 

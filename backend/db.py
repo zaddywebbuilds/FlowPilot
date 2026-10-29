@@ -82,6 +82,15 @@ CREATE TABLE IF NOT EXISTS settings (
     key             TEXT PRIMARY KEY,
     value           TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash      TEXT PRIMARY KEY,
+    created_at      REAL NOT NULL,
+    expires_at      REAL NOT NULL,
+    label           TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 """
 
 DEFAULT_SETTINGS = {
@@ -96,6 +105,7 @@ DEFAULT_SETTINGS = {
     "respect_robots_txt": "1",
     "browser_channel": "chrome",
     "headless": "0",
+    "session_days": "14",
     "allowed_domains": "quotes.toscrape.com\nbooks.toscrape.com\nlocalhost\n127.0.0.1",
 }
 
@@ -167,6 +177,13 @@ def set_setting(key, value):
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, str(value)),
     )
+
+
+def session_days():
+    try:
+        return max(1, int(get_setting("session_days", "14")))
+    except ValueError:
+        return 14
 
 
 def allowed_domains():

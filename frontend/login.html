@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowPilot</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%237c5cff'/><path d='M9 22V10h11M9 16h8' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round'/></svg>">
+</head>
+<body class="auth-body">
+
+<main class="auth-card">
+  <div class="auth-brand">
+    <svg viewBox="0 0 32 32" width="34" height="34"><rect width="32" height="32" rx="8" fill="#7c5cff"/><path d="M9 22V10h11M9 16h8" stroke="white" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>
+    <span>FlowPilot</span>
+  </div>
+
+  <h1 id="authTitle">Sign in</h1>
+  <p class="auth-sub" id="authSub">Enter the operator password to continue.</p>
+
+  <form id="authForm" autocomplete="on">
+    <div class="field">
+      <label for="password" id="passwordLabel">Password</label>
+      <input type="password" id="password" name="password"
+             autocomplete="current-password" required autofocus>
+      <div class="hint" id="passwordHint"></div>
+    </div>
+
+    <div class="field" id="confirmField" style="display:none">
+      <label for="confirm">Confirm password</label>
+      <input type="password" id="confirm" name="confirm" autocomplete="new-password">
+    </div>
+
+    <div class="auth-error" id="authError"></div>
+
+    <button type="submit" class="btn primary auth-submit" id="authSubmit">Sign in</button>
+  </form>
+
+  <p class="auth-foot">This dashboard controls a real browser. Keep the password private.</p>
+</main>
+
+<script src="/login.js"></script>
+</body>
+</html>

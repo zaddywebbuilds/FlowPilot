@@ -49,6 +49,10 @@ async function api(path, options = {}) {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   });
+  if (res.status === 401) {
+    location.href = '/login';
+    throw new Error('Not authenticated.');
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try { detail = (await res.json()).detail || detail; } catch {}
@@ -866,8 +870,33 @@ RENDERERS.settings = async () => {
             Your own systems, a client's with written approval, or a site whose terms allow it.</div></div>
         </div>
       </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="card-head"><div><h2>Access</h2>
+          <p>The password that protects this dashboard.</p></div></div>
+        <div class="card-body">
+          <div class="field"><label>New password</label>
+            <input type="password" id="newPassword" autocomplete="new-password">
+            <div class="hint">At least 8 characters. Changing it signs out every other device.</div></div>
+          <div class="field"><label>Confirm new password</label>
+            <input type="password" id="newPasswordConfirm" autocomplete="new-password"></div>
+          <button class="btn" id="changePassword">Change password</button>
+        </div>
+      </div>
     </div>
   </div>`;
+
+  $('#changePassword').onclick = async () => {
+    const value = $('#newPassword').value;
+    if (value.length < 8) return toast('Password must be at least 8 characters.', 'error');
+    if (value !== $('#newPasswordConfirm').value) return toast('Those passwords do not match.', 'error');
+    try {
+      await api('/auth/password', { method: 'POST', body: JSON.stringify({ password: value }) });
+      $('#newPassword').value = '';
+      $('#newPasswordConfirm').value = '';
+      toast('Password changed. Other devices were signed out.', 'success');
+    } catch (e) { toast(e.message, 'error'); }
+  };
 
   $('#saveSettings').onclick = async () => {
     const values = {};
@@ -917,10 +946,19 @@ function connect() {
     }
   };
 
-  ws.onclose = () => setTimeout(connect, 1800);
+  ws.onclose = (ev) => {
+    // 1008 is the policy-violation close the server sends for an invalid session.
+    if (ev.code === 1008) { location.href = '/login'; return; }
+    setTimeout(connect, 1800);
+  };
 }
 
 // -- boot --------------------------------------------------------------------
+
+$('#logoutBtn').onclick = async () => {
+  try { await api('/auth/logout', { method: 'POST' }); } catch {}
+  location.href = '/login';
+};
 
 $('#themeToggle').onclick = () => {
   const dark = document.documentElement.dataset.theme === 'dark';
