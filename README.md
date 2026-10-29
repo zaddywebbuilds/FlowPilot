@@ -56,37 +56,43 @@ A demo workflow against `quotes.toscrape.com` (a site published for automation
 practice) is seeded with five records. Open Overview and press **Start new run** to
 watch the whole pipeline work end to end.
 
-## Running it 24/7 on a VPS
+## Running it 24/7 on a server
 
-The app is plain Python, so it runs anywhere. On a Linux box:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install --with-deps chromium
-.venv/bin/uvicorn app:app --app-dir backend --host 127.0.0.1 --port 8000
-```
-
-On a server you need the bundled Chromium, since there is no installed Chrome and no
-desktop: run `.venv/bin/playwright install --with-deps chromium`, then set **Browser**
-to "Playwright bundled Chromium" and turn **Run headless** on in Settings. Put it under
-systemd so it survives a reboot.
-
-**Put TLS in front of it before exposing the port.** The dashboard has a password, and
-nothing is reachable until that password is set, but plain HTTP sends it in cleartext
-and anyone on the network path can read it. Two options:
-
-*Private, no certificate needed.* Keep it bound to 127.0.0.1 and tunnel in:
+On a fresh Debian or Ubuntu box, as root:
 
 ```bash
-ssh -L 8000:127.0.0.1:8000 you@your-vps
+curl -fsSL https://raw.githubusercontent.com/zaddywebbuilds/FlowPilot/main/deploy/install.sh -o install.sh
+DOMAIN=flowpilot.example.com bash install.sh
 ```
 
-Then browse to http://127.0.0.1:8000 on your own machine.
+That installs Python and Chromium with its system libraries, creates a `flowpilot`
+service account, runs the app under systemd with headless mode on, and puts Caddy in
+front so HTTPS works with a real certificate. Point the domain's DNS at the server
+first, otherwise the certificate request fails.
 
-*Shared with someone else.* Put Caddy or nginx in front with a real certificate, proxy
-to 127.0.0.1:8000, and leave port 8000 itself closed in the firewall. The session cookie
-sets its Secure flag automatically once requests arrive over HTTPS.
+**No domain?** Drop `DOMAIN=` and run `bash install.sh`. FlowPilot then listens only on
+127.0.0.1, so it is not reachable from the internet at all, and you reach it through an
+SSH tunnel:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 root@your-server-ip
+```
+
+Then open http://127.0.0.1:8000 on your own machine.
+
+Either way port 8000 is never exposed directly. The dashboard requires a password
+before anything is reachable, and the session cookie sets its Secure flag automatically
+once requests arrive over HTTPS. Avoid serving it over plain HTTP on a public address,
+since the password would cross the network in the clear.
+
+To update later: `bash /opt/flowpilot/deploy/update.sh`. Your database, password and run
+history are kept.
+
+| Task | Command |
+|---|---|
+| Logs | `journalctl -u flowpilot -f` |
+| Restart | `systemctl restart flowpilot` |
+| Status | `systemctl status flowpilot` |
 
 ## Screens
 

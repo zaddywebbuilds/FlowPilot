@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -122,12 +123,19 @@ def conn():
         return _conn
 
 
+# Only these may be seeded from the environment, so a server install can set
+# headless mode and the bundled browser without a first visit to Settings.
+ENV_SEEDABLE = ("headless", "browser_channel", "min_delay_seconds", "max_delay_seconds")
+
+
 def init_db():
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     c = conn()
     with _lock:
         c.executescript(SCHEMA)
         for key, value in DEFAULT_SETTINGS.items():
+            if key in ENV_SEEDABLE:
+                value = os.environ.get(f"FLOWPILOT_{key.upper()}", value)
             c.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value)
             )
