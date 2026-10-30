@@ -114,11 +114,43 @@ if [ -n "$DOMAIN" ]; then
         apt-get install -y -qq caddy >/dev/null
     fi
 
-    cat > /etc/caddy/Caddyfile <<CADDY
+    CADDYFILE=/etc/caddy/Caddyfile
+    SNIPPET_DIR=/etc/caddy/conf.d
+    BACKUP="$CADDYFILE.before-flowpilot.$(date +%Y%m%d-%H%M%S)"
+
+    # This server may already be serving other sites. Never overwrite the main
+    # Caddyfile: keep FlowPilot in its own snippet and import it.
+    mkdir -p "$SNIPPET_DIR"
+    if [ -f "$CADDYFILE" ]; then
+        cp -a "$CADDYFILE" "$BACKUP"
+        info "backed up existing Caddyfile to $BACKUP"
+        EXISTING=$(grep -cE '^[[:space:]]*[a-z0-9.*:-]+[[:space:]]*\{' "$CADDYFILE" || true)
+        if [ "${EXISTING:-0}" -gt 0 ]; then
+            info "it already defines $EXISTING site block(s), leaving them alone"
+        fi
+    else
+        touch "$CADDYFILE"
+    fi
+
+    cat > "$SNIPPET_DIR/flowpilot.caddy" <<CADDY
 $DOMAIN {
     reverse_proxy 127.0.0.1:$PORT
 }
 CADDY
+
+    if ! grep -qE "import[[:space:]]+$SNIPPET_DIR/\*" "$CADDYFILE"; then
+        printf '\nimport %s/*.caddy\n' "$SNIPPET_DIR" >> "$CADDYFILE"
+        info "added an import line for $SNIPPET_DIR"
+    fi
+
+    if ! caddy validate --adapter caddyfile --config "$CADDYFILE" >/dev/null 2>&1; then
+        if [ -f "$BACKUP" ]; then
+            cp -a "$BACKUP" "$CADDYFILE"
+            rm -f "$SNIPPET_DIR/flowpilot.caddy"
+            die "Caddy rejected the new config. Your original Caddyfile has been restored, nothing changed."
+        fi
+        die "Caddy rejected the generated config at $CADDYFILE"
+    fi
 
     systemctl reload caddy 2>/dev/null || systemctl restart caddy
     info "Caddy will request a certificate automatically"
