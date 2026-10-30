@@ -6,8 +6,9 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "flowpilot.db"
-EVIDENCE_DIR = ROOT / "evidence"
+# Overridable so tests and deployments can put state somewhere else.
+DB_PATH = Path(os.environ.get("FLOWPILOT_DB_PATH") or ROOT / "flowpilot.db")
+EVIDENCE_DIR = Path(os.environ.get("FLOWPILOT_EVIDENCE_DIR") or ROOT / "evidence")
 
 _lock = threading.RLock()
 _conn = None
@@ -94,6 +95,18 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
 """
 
+# Columns added after the first release. Existing databases are migrated in
+# place on startup, so an upgrade never needs the file to be deleted.
+MIGRATIONS = [
+    ("workflows", "schedule_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("workflows", "schedule_kind", "TEXT NOT NULL DEFAULT 'interval'"),
+    ("workflows", "schedule_minutes", "INTEGER NOT NULL DEFAULT 60"),
+    ("workflows", "schedule_at", "TEXT NOT NULL DEFAULT '09:00'"),
+    ("workflows", "schedule_batch", "INTEGER NOT NULL DEFAULT 25"),
+    ("workflows", "next_run_at", "REAL"),
+    ("runs", "trigger", "TEXT NOT NULL DEFAULT 'manual'"),
+]
+
 DEFAULT_SETTINGS = {
     "workspace_name": "FlowPilot",
     "default_batch_size": "25",
@@ -107,6 +120,12 @@ DEFAULT_SETTINGS = {
     "browser_channel": "chrome",
     "headless": "0",
     "session_days": "14",
+    "evidence_retention_days": "14",
+    "scheduler_enabled": "1",
+    "notify_webhook_url": "",
+    "notify_on_finish": "1",
+    "notify_on_review": "1",
+    "notify_on_failure": "1",
     "allowed_domains": "quotes.toscrape.com\nbooks.toscrape.com\nlocalhost\n127.0.0.1",
 }
 
@@ -128,11 +147,47 @@ def conn():
 ENV_SEEDABLE = ("headless", "browser_channel", "min_delay_seconds", "max_delay_seconds")
 
 
+def _ensure_column(c, table, column, declaration):
+    existing = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def recover_interrupted_runs():
+    """Close out runs that were in flight when the process stopped.
+
+    Without this a crash or reboot leaves the run marked 'running' forever and
+    its records stuck on 'processing', so they are never picked up again.
+    """
+    stuck = query("SELECT id FROM runs WHERE status IN ('running', 'paused')")
+    if not stuck:
+        return 0
+    ids = [r["id"] for r in stuck]
+    placeholders = ",".join("?" * len(ids))
+    execute(
+        f"UPDATE runs SET status = 'interrupted', finished_at = ? "
+        f"WHERE id IN ({placeholders})",
+        (time.time(), *ids),
+    )
+    execute(
+        "UPDATE run_items SET status = 'failed', issue = 'interrupted', "
+        f"error = 'Server stopped during this run' WHERE status = 'processing' "
+        f"AND run_id IN ({placeholders})",
+        tuple(ids),
+    )
+    execute("UPDATE records SET status = 'pending' WHERE status = 'processing'")
+    for run_id in ids:
+        log_event(run_id, "Run was interrupted by a server restart.", "warn")
+    return len(ids)
+
+
 def init_db():
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
     c = conn()
     with _lock:
         c.executescript(SCHEMA)
+        for table, column, declaration in MIGRATIONS:
+            _ensure_column(c, table, column, declaration)
         for key, value in DEFAULT_SETTINGS.items():
             if key in ENV_SEEDABLE:
                 value = os.environ.get(f"FLOWPILOT_{key.upper()}", value)
@@ -237,8 +292,90 @@ def list_workflows():
     out = []
     for wf in query("SELECT * FROM workflows ORDER BY id"):
         wf["steps"] = json.loads(wf.pop("steps_json"))
+        wf["pending"] = count_records(wf["id"]).get("pending", 0)
         out.append(wf)
     return out
+
+
+def update_workflow(workflow_id, **fields):
+    if "steps" in fields:
+        fields["steps_json"] = json.dumps(fields.pop("steps"))
+    if "target_domain" in fields:
+        fields["target_domain"] = fields["target_domain"].lower()
+    allowed = {
+        "name", "description", "target_domain", "steps_json", "authorized_by",
+        "schedule_enabled", "schedule_kind", "schedule_minutes", "schedule_at",
+        "schedule_batch", "next_run_at",
+    }
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return get_workflow(workflow_id)
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    execute(f"UPDATE workflows SET {sets} WHERE id = ?", (*fields.values(), workflow_id))
+    return get_workflow(workflow_id)
+
+
+def delete_workflow(workflow_id):
+    execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
+
+
+def scheduled_workflows():
+    out = []
+    for wf in query("SELECT * FROM workflows WHERE schedule_enabled = 1 ORDER BY id"):
+        wf["steps"] = json.loads(wf.pop("steps_json"))
+        wf["pending"] = count_records(wf["id"]).get("pending", 0)
+        out.append(wf)
+    return out
+
+
+# evidence ------------------------------------------------------------------
+
+def prune_evidence():
+    """Delete screenshot folders for runs older than the retention window.
+
+    Every step of every record writes a JPEG, so without this the disk fills up
+    on a long-running server.
+    """
+    try:
+        days = int(get_setting("evidence_retention_days", "14"))
+    except ValueError:
+        days = 14
+    if days <= 0:
+        return 0
+
+    cutoff = time.time() - days * 86400
+    old = query(
+        "SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?",
+        (cutoff,),
+    )
+    removed = 0
+    for row in old:
+        folder = EVIDENCE_DIR / f"run_{row['id']}"
+        if folder.is_dir():
+            for child in folder.iterdir():
+                try:
+                    child.unlink()
+                except OSError:
+                    pass
+            try:
+                folder.rmdir()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def evidence_usage():
+    total = 0
+    count = 0
+    if EVIDENCE_DIR.is_dir():
+        for path in EVIDENCE_DIR.rglob("*.jpg"):
+            try:
+                total += path.stat().st_size
+                count += 1
+            except OSError:
+                pass
+    return {"files": count, "bytes": total}
 
 
 # records --------------------------------------------------------------------
@@ -302,11 +439,11 @@ def set_record_status(record_id, status):
 
 # runs -----------------------------------------------------------------------
 
-def create_run(workflow_id, batch_size, total):
+def create_run(workflow_id, batch_size, total, trigger="manual"):
     return execute(
-        "INSERT INTO runs(workflow_id, batch_size, status, total, started_at) "
-        "VALUES (?,?,?,?,?)",
-        (workflow_id, batch_size, "running", total, time.time()),
+        "INSERT INTO runs(workflow_id, batch_size, status, total, started_at, trigger) "
+        "VALUES (?,?,?,?,?,?)",
+        (workflow_id, batch_size, "running", total, time.time(), trigger),
     )
 
 

@@ -37,7 +37,35 @@ const state = {
   queueFilter: { status: 'all', search: '' },
   reviewFilter: 'all',
   openRun: null,
+  workflowId: Number(localStorage.getItem('fp-workflow')) || null,
+  workflows: [],
+  editingWorkflow: null,
 };
+
+/** Query fragment pinning requests to the selected workflow. */
+function wfQuery(prefix = '?') {
+  return state.workflowId ? `${prefix}workflow_id=${state.workflowId}` : '';
+}
+
+function setWorkflow(id) {
+  state.workflowId = id ? Number(id) : null;
+  try { localStorage.setItem('fp-workflow', state.workflowId || ''); } catch {}
+  state.openRun = null;
+  render();
+}
+
+function workflowSelect(id = 'wfSelect') {
+  if (state.workflows.length < 2) return '';
+  return `<select id="${id}" style="min-width:190px">
+    ${state.workflows.map((w) => `<option value="${w.id}"
+      ${w.id === state.workflowId ? 'selected' : ''}>${esc(w.name)}</option>`).join('')}
+  </select>`;
+}
+
+function bindWorkflowSelect(id = 'wfSelect') {
+  const el = $(`#${id}`);
+  if (el) el.onchange = (e) => setWorkflow(e.target.value);
+}
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const view = $('#view');
@@ -146,18 +174,25 @@ async function render() {
 // -- Overview ----------------------------------------------------------------
 
 RENDERERS.overview = async () => {
-  const d = await api('/overview');
+  const d = await api(`/overview${wfQuery()}`);
   state.badges.review = d.counts.review || 0;
+  state.workflows = d.workflows;
+  if (!state.workflowId && d.workflow) state.workflowId = d.workflow.id;
   renderNav();
 
   const wf = d.workflow;
-  const pct = d.counts.total ? Math.round(d.counts.completed / d.counts.total * 100) : 0;
   const busy = state.engine.status !== 'idle';
+  const sched = wf.schedule_enabled
+    ? (wf.schedule_kind === 'daily'
+        ? `daily at ${esc(wf.schedule_at)}`
+        : `every ${wf.schedule_minutes} min`)
+    : 'off';
 
   view.innerHTML = pageHead(
     'Overview',
     'Monitor and control automation runs against targets you are authorized to use.',
-    `<button class="btn primary" id="startBtn" ${busy ? 'disabled' : ''}>
+    `${workflowSelect()}
+     <button class="btn primary" id="startBtn" ${busy ? 'disabled' : ''}>
        ${busy ? 'Run in progress' : 'Start new run'}</button>`
   ) + `
   <div class="grid cols-4" style="margin-bottom:16px">
@@ -176,6 +211,10 @@ RENDERERS.overview = async () => {
         <div class="kv"><span>Target</span><span class="mono">${esc(wf.target_domain)}</span></div>
         <div class="kv"><span>Steps</span><span>${wf.steps.length}</span></div>
         <div class="kv"><span>Authorization</span><span class="chip completed">on record</span></div>
+        <div class="kv"><span>Schedule</span>
+          <span class="${wf.schedule_enabled ? '' : 'muted'}">${sched}
+            ${wf.schedule_enabled && wf.next_run_at
+              ? `<span class="muted">(next ${fmtTime(wf.next_run_at)})</span>` : ''}</span></div>
 
         <div class="field" style="margin-top:16px">
           <label for="batchSize">Batch size</label>
@@ -218,6 +257,7 @@ RENDERERS.overview = async () => {
     </div>
   </div>`;
 
+  bindWorkflowSelect();
   $('#startBtn').onclick = startRun;
   $('#pauseBtn').onclick = () => control('pause');
   $('#resumeBtn').onclick = () => control('resume');
@@ -249,7 +289,7 @@ async function startRun() {
   try {
     const r = await api('/run/start', {
       method: 'POST',
-      body: JSON.stringify({ batch_size: batch }),
+      body: JSON.stringify({ batch_size: batch, workflow_id: state.workflowId }),
     });
     toast(`Run #${r.run_id} started`, 'success');
     navigate('live');
@@ -266,81 +306,246 @@ async function control(action) {
 
 // -- Automation Studio -------------------------------------------------------
 
+const STEP_TYPES = ['goto', 'wait_for', 'fill', 'click', 'assert_text', 'extract'];
+
+const BLANK_WORKFLOW = {
+  id: null, name: '', description: '', target_domain: '', authorized_by: '',
+  steps: [{ type: 'goto', url: 'https://example.com/', label: 'Open page' }],
+};
+
 RENDERERS.studio = async () => {
   const workflows = await api('/workflows');
+  state.workflows = workflows;
+  const editing = state.editingWorkflow
+    ? workflows.find((w) => w.id === state.editingWorkflow) || BLANK_WORKFLOW
+    : BLANK_WORKFLOW;
+  const isEdit = Boolean(editing.id);
 
   view.innerHTML = pageHead(
     'Automation Studio',
-    'Define the steps a run executes. Every workflow records who authorized automating its target.'
+    'Define what a run does, who approved it, and when it runs on its own.',
+    isEdit ? `<button class="btn" id="newWf">New workflow</button>` : ''
   ) + `
   <div class="grid split">
-    <div class="card">
-      <div class="card-head"><div><h2>Workflows</h2>
-        <p>${workflows.length} configured.</p></div></div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Name</th><th>Target</th><th>Steps</th><th>Authorized by</th></tr></thead>
-        <tbody>${workflows.map((w) => `<tr>
-          <td><strong>${esc(w.name)}</strong><div class="muted" style="font-size:12px">${esc(w.description)}</div></td>
-          <td class="mono">${esc(w.target_domain)}</td>
-          <td>${w.steps.length}</td>
-          <td class="muted"><div class="truncate">${esc(w.authorized_by)}</div></td>
-        </tr>`).join('')}</tbody>
-      </table></div>
+    <div>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-head"><div><h2>Workflows</h2>
+          <p>${workflows.length} configured.</p></div></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Name</th><th>Target</th><th>Steps</th><th>Queue</th><th>Schedule</th><th></th></tr></thead>
+          <tbody>${workflows.map((w) => `<tr${w.id === editing.id ? ' style="background:var(--accent-soft)"' : ''}>
+            <td><strong>${esc(w.name)}</strong>
+              <div class="muted" style="font-size:11.5px"><div class="truncate">${esc(w.description)}</div></div></td>
+            <td class="mono">${esc(w.target_domain)}</td>
+            <td>${w.steps.length}</td>
+            <td>${w.pending ? `<span class="chip pending">${w.pending}</span>` : '<span class="muted">0</span>'}</td>
+            <td>${w.schedule_enabled
+              ? `<span class="chip running">${w.schedule_kind === 'daily'
+                  ? esc(w.schedule_at) : `${w.schedule_minutes}m`}</span>`
+              : '<span class="muted">off</span>'}</td>
+            <td style="text-align:right;white-space:nowrap">
+              <button class="btn sm" data-edit="${w.id}">Edit</button>
+              <button class="btn sm" data-del-wf="${w.id}">Delete</button>
+            </td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+      </div>
+
+      ${isEdit ? scheduleCardHTML(editing) : ''}
     </div>
 
     <div class="card">
-      <div class="card-head"><div><h2>New workflow</h2>
-        <p>Steps are JSON. Supported types: goto, wait_for, fill, click, assert_text, extract.</p></div></div>
+      <div class="card-head"><div><h2>${isEdit ? 'Edit workflow' : 'New workflow'}</h2>
+        <p>${isEdit ? esc(editing.name) : 'Steps run in order for every record.'}</p></div></div>
       <div class="card-body">
-        <div class="field"><label>Name</label><input type="text" id="wfName" placeholder="Staging smoke test"></div>
-        <div class="field"><label>Target domain</label><input type="text" id="wfDomain" placeholder="staging.example.com">
-          <div class="hint">Must also be added to Settings allowed domains.</div></div>
-        <div class="field"><label>Who authorized this?</label><input type="text" id="wfAuth" placeholder="Jane Doe, CTO at Example Ltd, 2026-10-29">
-          <div class="hint">Required. Stored with the workflow as your record of permission.</div></div>
-        <div class="field"><label>Steps (JSON array)</label>
-          <textarea id="wfSteps" rows="9">[
-  {"type": "goto", "url": "https://staging.example.com/login", "label": "Open login"},
-  {"type": "fill", "selector": "#email", "value": "{{email}}", "label": "Fill email"},
-  {"type": "click", "selector": "button[type=submit]", "label": "Submit"},
-  {"type": "assert_text", "selector": ".flash", "value": "Welcome", "label": "Verify"}
-]</textarea></div>
-        <button class="btn primary" id="saveWf">Save workflow</button>
+        <div class="field"><label>Name</label>
+          <input type="text" id="wfName" value="${esc(editing.name)}" placeholder="Staging smoke test"></div>
+        <div class="field"><label>Description</label>
+          <input type="text" id="wfDesc" value="${esc(editing.description)}" placeholder="What this run does"></div>
+        <div class="field"><label>Target domain</label>
+          <input type="text" id="wfDomain" value="${esc(editing.target_domain)}" placeholder="staging.example.com">
+          <div class="hint">Must also be in Settings allowed domains, or runs are refused.</div></div>
+        <div class="field"><label>Who authorized this?</label>
+          <input type="text" id="wfAuth" value="${esc(editing.authorized_by)}" placeholder="Jane Doe, CTO at Example Ltd">
+          <div class="hint">Required. Stored as your record of permission.</div></div>
+
+        <div class="field"><label>Add a step</label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <select id="stType" style="width:120px">
+              ${STEP_TYPES.map((t) => `<option value="${t}">${t}</option>`).join('')}
+            </select>
+            <input type="text" id="stTarget" placeholder="URL or CSS selector" style="flex:1;min-width:150px">
+            <input type="text" id="stValue" placeholder="value" style="width:110px">
+            <button class="btn sm" id="addStep">Add</button>
+          </div>
+          <div class="hint">Use <span class="mono">{{column}}</span> to pull a value from each record.</div>
+        </div>
+
+        <div class="field"><label>Steps</label>
+          <textarea id="wfSteps" rows="10">${esc(JSON.stringify(editing.steps, null, 2))}</textarea></div>
+
+        <button class="btn primary" id="saveWf">${isEdit ? 'Save changes' : 'Create workflow'}</button>
+        ${isEdit ? '<button class="btn" id="cancelEdit" style="margin-left:8px">Cancel</button>' : ''}
       </div>
     </div>
   </div>`;
+
+  $('#newWf') && ($('#newWf').onclick = () => { state.editingWorkflow = null; render(); });
+  $('#cancelEdit') && ($('#cancelEdit').onclick = () => { state.editingWorkflow = null; render(); });
+
+  view.querySelectorAll('[data-edit]').forEach((b) =>
+    b.onclick = () => { state.editingWorkflow = Number(b.dataset.edit); render(); });
+
+  view.querySelectorAll('[data-del-wf]').forEach((b) => b.onclick = async () => {
+    const wf = workflows.find((w) => w.id === Number(b.dataset.delWf));
+    if (!window.confirm(
+      `Delete "${wf.name}"?\n\nIts ${wf.pending || 0} pending record(s) and run history go too. This cannot be undone.`
+    )) return;
+    try {
+      await api(`/workflows/${wf.id}`, { method: 'DELETE' });
+      if (state.workflowId === wf.id) setWorkflow(null);
+      if (state.editingWorkflow === wf.id) state.editingWorkflow = null;
+      toast('Workflow deleted');
+      render();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+
+  $('#addStep').onclick = () => {
+    const type = $('#stType').value;
+    const target = $('#stTarget').value.trim();
+    const value = $('#stValue').value.trim();
+    if (!target) return toast('Enter a URL or selector first.', 'error');
+
+    const step = { type, label: `${type} ${target}`.slice(0, 40) };
+    if (type === 'goto') step.url = target; else step.selector = target;
+    if (type === 'extract') step.field = value || 'value';
+    else if (value) step.value = value;
+
+    let steps;
+    try { steps = JSON.parse($('#wfSteps').value); }
+    catch { return toast('Fix the JSON below before adding a step.', 'error'); }
+    steps.push(step);
+    $('#wfSteps').value = JSON.stringify(steps, null, 2);
+    $('#stTarget').value = '';
+    $('#stValue').value = '';
+  };
 
   $('#saveWf').onclick = async () => {
     let steps;
     try { steps = JSON.parse($('#wfSteps').value); }
     catch { return toast('Steps must be valid JSON.', 'error'); }
+    if (!Array.isArray(steps) || !steps.length) return toast('Add at least one step.', 'error');
+
+    const body = {
+      name: $('#wfName').value.trim(),
+      description: $('#wfDesc').value.trim(),
+      target_domain: $('#wfDomain').value.trim(),
+      authorized_by: $('#wfAuth').value.trim(),
+      steps,
+    };
+    if (!body.name || !body.target_domain) return toast('Name and target domain are required.', 'error');
+
     try {
-      await api('/workflows', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: $('#wfName').value.trim(),
-          target_domain: $('#wfDomain').value.trim(),
-          authorized_by: $('#wfAuth').value.trim(),
-          description: '',
-          steps,
-        }),
-      });
-      toast('Workflow saved', 'success');
+      if (isEdit) {
+        await api(`/workflows/${editing.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+        toast('Workflow updated', 'success');
+      } else {
+        await api('/workflows', { method: 'POST', body: JSON.stringify(body) });
+        toast('Workflow created', 'success');
+        state.editingWorkflow = null;
+      }
       render();
     } catch (e) { toast(e.message, 'error'); }
   };
+
+  if (isEdit) bindSchedule(editing);
 };
+
+function scheduleCardHTML(wf) {
+  const on = Boolean(wf.schedule_enabled);
+  return `<div class="card">
+    <div class="card-head"><div><h2>Schedule</h2>
+      <p>Run "${esc(wf.name)}" automatically.</p></div></div>
+    <div class="card-body">
+      <label class="switch">
+        <input type="checkbox" id="schEnabled" ${on ? 'checked' : ''}>
+        <span class="track"></span>
+        <span class="switch-text"><strong>Run on a schedule</strong>
+          <span>Only fires when the queue has pending records and nothing else is running.</span></span>
+      </label>
+
+      <div id="schFields" style="${on ? '' : 'opacity:.45;pointer-events:none'}">
+        <div class="grid cols-2" style="margin-top:12px">
+          <div class="field"><label>How often</label>
+            <select id="schKind">
+              <option value="interval" ${wf.schedule_kind !== 'daily' ? 'selected' : ''}>Every N minutes</option>
+              <option value="daily" ${wf.schedule_kind === 'daily' ? 'selected' : ''}>Once a day</option>
+            </select></div>
+          <div class="field" id="schIntervalField" style="${wf.schedule_kind === 'daily' ? 'display:none' : ''}">
+            <label>Minutes between runs</label>
+            <input type="number" id="schMinutes" min="1" value="${wf.schedule_minutes || 60}"></div>
+          <div class="field" id="schDailyField" style="${wf.schedule_kind === 'daily' ? '' : 'display:none'}">
+            <label>Time (server clock)</label>
+            <input type="text" id="schAt" value="${esc(wf.schedule_at || '09:00')}" placeholder="09:00"></div>
+          <div class="field"><label>Records per run</label>
+            <input type="number" id="schBatch" min="1" value="${wf.schedule_batch || 25}"></div>
+        </div>
+        ${on && wf.next_run_at
+          ? `<div class="kv"><span>Next run</span><span>${fmtTime(wf.next_run_at)}</span></div>` : ''}
+      </div>
+
+      <button class="btn primary" id="saveSchedule" style="margin-top:12px">Save schedule</button>
+    </div>
+  </div>`;
+}
+
+function bindSchedule(wf) {
+  const fields = $('#schFields');
+  $('#schEnabled').onchange = (e) => {
+    fields.style.opacity = e.target.checked ? '' : '.45';
+    fields.style.pointerEvents = e.target.checked ? '' : 'none';
+  };
+  $('#schKind').onchange = (e) => {
+    const daily = e.target.value === 'daily';
+    $('#schIntervalField').style.display = daily ? 'none' : '';
+    $('#schDailyField').style.display = daily ? '' : 'none';
+  };
+  $('#saveSchedule').onclick = async () => {
+    const at = $('#schAt').value.trim();
+    if ($('#schKind').value === 'daily' && !/^\d{1,2}:\d{2}$/.test(at)) {
+      return toast('Time must look like 09:00.', 'error');
+    }
+    try {
+      await api(`/workflows/${wf.id}/schedule`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: $('#schEnabled').checked,
+          kind: $('#schKind').value,
+          minutes: parseInt($('#schMinutes').value || '60', 10),
+          at,
+          batch: parseInt($('#schBatch').value || '25', 10),
+        }),
+      });
+      toast('Schedule saved', 'success');
+      render();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+}
 
 // -- Record Queue ------------------------------------------------------------
 
 RENDERERS.queue = async () => {
   const { status, search } = state.queueFilter;
-  const d = await api(`/records?status=${status}&search=${encodeURIComponent(search)}&limit=200`);
+  const d = await api(
+    `/records?status=${status}&search=${encodeURIComponent(search)}&limit=200${wfQuery('&')}`
+  );
   const c = d.counts;
 
   view.innerHTML = pageHead(
     'Record Queue',
     'Import, filter and manage the records a run will process.',
-    `<button class="btn" id="importToggle">Import CSV</button>`
+    `${workflowSelect('qWfSelect')}
+     <button class="btn" id="importToggle">Import</button>`
   ) + `
   <div class="grid cols-4" style="margin-bottom:16px">
     ${statTile('db', '', c.total || 0, 'Total records')}
@@ -351,10 +556,18 @@ RENDERERS.queue = async () => {
 
   <div class="card" id="importPanel" style="display:none;margin-bottom:16px">
     <div class="card-head"><div><h2>Import records</h2>
-      <p>Paste CSV with a header row. Duplicates are skipped automatically.</p></div></div>
+      <p>Duplicates are skipped automatically, so re-importing is safe.</p></div></div>
     <div class="card-body">
-      <textarea id="csvText" rows="6" placeholder="name,tag&#10;Love tag,love&#10;Humor tag,humor"></textarea>
-      <button class="btn primary" id="doImport" style="margin-top:12px">Import</button>
+      <div class="field"><label>From a Google Sheet</label>
+        <input type="text" id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/d/...">
+        <div class="hint">Share it as "Anyone with the link can view" first. The first row is the header.</div>
+      </div>
+      <button class="btn primary" id="doSheet">Import from Sheet</button>
+
+      <div class="field" style="margin-top:20px"><label>Or paste CSV</label>
+        <textarea id="csvText" rows="5" placeholder="name,tag&#10;Love tag,love&#10;Humor tag,humor"></textarea>
+      </div>
+      <button class="btn" id="doImport">Import CSV</button>
     </div>
   </div>
 
@@ -391,15 +604,33 @@ RENDERERS.queue = async () => {
     const p = $('#importPanel');
     p.style.display = p.style.display === 'none' ? 'block' : 'none';
   };
+  bindWorkflowSelect('qWfSelect');
   $('#doImport').onclick = async () => {
     try {
       const r = await api('/records/import', {
         method: 'POST',
-        body: JSON.stringify({ csv_text: $('#csvText').value }),
+        body: JSON.stringify({ csv_text: $('#csvText').value, workflow_id: state.workflowId }),
       });
       toast(`Imported ${r.inserted}, skipped ${r.skipped_duplicates} duplicate(s)`, 'success');
       render();
     } catch (e) { toast(e.message, 'error'); }
+  };
+  $('#doSheet').onclick = async () => {
+    const url = $('#sheetUrl').value.trim();
+    if (!url) return toast('Paste the sheet link first.', 'error');
+    const btn = $('#doSheet');
+    btn.disabled = true; btn.textContent = 'Fetching...';
+    try {
+      const r = await api('/records/import-sheet', {
+        method: 'POST',
+        body: JSON.stringify({ url, workflow_id: state.workflowId }),
+      });
+      toast(`Imported ${r.inserted}, skipped ${r.skipped_duplicates}. Columns: ${r.columns.join(', ')}`, 'success');
+      render();
+    } catch (e) {
+      toast(e.message, 'error');
+      btn.disabled = false; btn.textContent = 'Import from Sheet';
+    }
   };
   $('#qStatus').onchange = (e) => { state.queueFilter.status = e.target.value; render(); };
   let t;
@@ -760,7 +991,9 @@ function donut(slices, total) {
 // -- Integrations ------------------------------------------------------------
 
 RENDERERS.integrations = async () => {
-  const d = await api('/integrations');
+  const [d, sched, ev] = await Promise.all([
+    api('/integrations'), api('/schedule'), api('/evidence'),
+  ]);
 
   view.innerHTML = pageHead(
     'Integrations',
@@ -794,6 +1027,34 @@ RENDERERS.integrations = async () => {
     </div>
   </div>
 
+  <div class="grid cols-2" style="margin-top:16px">
+    <div class="card">
+      <div class="card-head"><div><h2>Scheduler</h2>
+        <p>Starts runs on their own when the queue has work.</p></div>
+        <div class="actions"><span class="chip ${sched.enabled && sched.running ? 'completed' : 'pending'}">
+          ${sched.enabled ? (sched.running ? 'running' : 'stopped') : 'disabled'}</span></div></div>
+      <div class="card-body">
+        ${sched.upcoming.length ? sched.upcoming.map((u) => `<div class="kv">
+          <span>${esc(u.name)} <span class="muted">(${u.pending} pending)</span></span>
+          <span>${u.next_run_at ? fmtTime(u.next_run_at) : 'arming'}</span></div>`).join('')
+          : '<div class="muted" style="font-size:13px">No workflow is scheduled. Turn one on in Automation Studio.</div>'}
+        ${sched.last_tick ? `<div class="kv"><span>Last check</span><span>${fmtTime(sched.last_tick)}</span></div>` : ''}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div><h2>Evidence storage</h2>
+        <p>Screenshots kept as proof of each step.</p></div></div>
+      <div class="card-body">
+        <div class="kv"><span>Files</span><span>${ev.files.toLocaleString()}</span></div>
+        <div class="kv"><span>Disk used</span><span>${ev.megabytes} MB</span></div>
+        <div class="kv"><span>Retention</span><span>${ev.retention_days === '0'
+          ? 'forever' : `${esc(ev.retention_days)} days`}</span></div>
+        <button class="btn" id="pruneNow" style="margin-top:12px">Prune old evidence now</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card" style="margin-top:16px">
     <div class="card-head"><div><h2>Local storage</h2>
       <p>Everything stays on this machine. Nothing is uploaded.</p></div></div>
@@ -805,6 +1066,14 @@ RENDERERS.integrations = async () => {
           ${d.respect_robots_txt ? 'on' : 'off'}</span></div>
     </div>
   </div>`;
+
+  $('#pruneNow').onclick = async () => {
+    try {
+      const r = await api('/evidence/prune', { method: 'POST' });
+      toast(`Pruned ${r.removed_runs} run folder(s). ${r.files} file(s) left.`, 'success');
+      render();
+    } catch (e) { toast(e.message, 'error'); }
+  };
 };
 
 // -- Settings ----------------------------------------------------------------
@@ -838,6 +1107,10 @@ RENDERERS.settings = async () => {
         <div class="field"><label>Stop after N consecutive failures</label>
           <input type="number" data-set="stop_on_consecutive_failures" value="${esc(s.stop_on_consecutive_failures)}">
           <div class="hint">Circuit breaker. Halts the run so a broken selector cannot burn the whole queue.</div></div>
+        <div class="field"><label>Keep evidence for (days)</label>
+          <input type="number" data-set="evidence_retention_days" value="${esc(s.evidence_retention_days)}">
+          <div class="hint">Screenshots from older runs are deleted automatically. 0 keeps everything,
+            which will fill the disk on a long-running server.</div></div>
         <div class="field"><label>Browser</label>
           <select data-set="browser_channel">
             ${[['chrome', 'Google Chrome (installed)'],
@@ -872,6 +1145,22 @@ RENDERERS.settings = async () => {
       </div>
 
       <div class="card" style="margin-top:16px">
+        <div class="card-head"><div><h2>Notifications</h2>
+          <p>Posts to a webhook when something needs you.</p></div></div>
+        <div class="card-body">
+          <div class="field"><label>Webhook URL</label>
+            <input type="text" data-set="notify_webhook_url" value="${esc(s.notify_webhook_url)}"
+                   placeholder="https://ntfy.sh/your-topic">
+            <div class="hint">Works with ntfy.sh, Slack, Discord, or anything accepting a JSON POST.
+              Save first, then send a test.</div></div>
+          ${sw('notify_on_finish', 'When a run finishes', 'Every completed batch.')}
+          ${sw('notify_on_review', 'When records need review', 'Something could not be confirmed.')}
+          ${sw('notify_on_failure', 'When a run fails', 'The engine stopped or was refused.')}
+          <button class="btn" id="testNotify" style="margin-top:8px">Send test</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
         <div class="card-head"><div><h2>Access</h2>
           <p>The password that protects this dashboard.</p></div></div>
         <div class="card-body">
@@ -885,6 +1174,16 @@ RENDERERS.settings = async () => {
       </div>
     </div>
   </div>`;
+
+  $('#testNotify').onclick = async () => {
+    const btn = $('#testNotify');
+    btn.disabled = true; btn.textContent = 'Sending...';
+    try {
+      await api('/notify/test', { method: 'POST' });
+      toast('Test sent. Check your phone or channel.', 'success');
+    } catch (e) { toast(e.message, 'error'); }
+    btn.disabled = false; btn.textContent = 'Send test';
+  };
 
   $('#changePassword').onclick = async () => {
     const value = $('#newPassword').value;

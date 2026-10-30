@@ -13,7 +13,10 @@ from pydantic import BaseModel
 
 import auth
 import db
+import notify
+import sheets
 from runner import AuthorizationError, engine
+from scheduler import compute_next_run, scheduler
 
 ROOT = Path(__file__).resolve().parent.parent
 FRONTEND = ROOT / "frontend"
@@ -61,7 +64,13 @@ def seed():
 async def lifespan(app: FastAPI):
     db.init_db()
     seed()
+    recovered = db.recover_interrupted_runs()
+    if recovered:
+        print(f"[flowpilot] recovered {recovered} interrupted run(s) from a previous stop")
+    db.prune_evidence()
+    scheduler.start()
     yield
+    await scheduler.stop()
 
 
 app = FastAPI(title="FlowPilot", lifespan=lifespan)
@@ -94,6 +103,27 @@ class WorkflowPayload(BaseModel):
     target_domain: str
     authorized_by: str
     steps: list[dict]
+
+
+class WorkflowPatch(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    target_domain: str | None = None
+    authorized_by: str | None = None
+    steps: list[dict] | None = None
+
+
+class SchedulePayload(BaseModel):
+    enabled: bool
+    kind: str = "interval"          # interval | daily
+    minutes: int = 60
+    at: str = "09:00"
+    batch: int = 25
+
+
+class SheetPayload(BaseModel):
+    workflow_id: int | None = None
+    url: str
 
 
 class SettingsPayload(BaseModel):
@@ -255,6 +285,52 @@ def post_workflow(payload: WorkflowPayload):
     return db.get_workflow(wf_id)
 
 
+@app.patch("/api/workflows/{workflow_id}")
+def patch_workflow(workflow_id: int, payload: WorkflowPatch):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found.")
+    fields = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "authorized_by" in fields and not fields["authorized_by"].strip():
+        raise HTTPException(400, "Authorization cannot be blank.")
+    return db.update_workflow(workflow_id, **fields)
+
+
+@app.delete("/api/workflows/{workflow_id}")
+def remove_workflow(workflow_id: int):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found.")
+    if engine.status != "idle" and engine.workflow_id == workflow_id:
+        raise HTTPException(409, "That workflow is running. Stop the run first.")
+    db.delete_workflow(workflow_id)
+    return {"ok": True}
+
+
+@app.put("/api/workflows/{workflow_id}/schedule")
+def set_schedule(workflow_id: int, payload: SchedulePayload):
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(404, "Workflow not found.")
+    if payload.kind not in ("interval", "daily"):
+        raise HTTPException(400, "kind must be 'interval' or 'daily'.")
+
+    updated = {
+        "schedule_enabled": 1 if payload.enabled else 0,
+        "schedule_kind": payload.kind,
+        "schedule_minutes": max(1, payload.minutes),
+        "schedule_at": payload.at,
+        "schedule_batch": max(1, payload.batch),
+    }
+    updated["next_run_at"] = (
+        compute_next_run({**workflow, **updated}) if payload.enabled else None
+    )
+    return db.update_workflow(workflow_id, **updated)
+
+
+@app.get("/api/schedule")
+def schedule_status():
+    return scheduler.status()
+
+
 # -- records / queue ---------------------------------------------------------
 
 @app.get("/api/records")
@@ -286,6 +362,22 @@ def import_records(payload: ImportPayload):
 
     inserted, skipped = db.add_records(wid, rows, source="csv")
     return {"inserted": inserted, "skipped_duplicates": skipped}
+
+
+@app.post("/api/records/import-sheet")
+def import_sheet(payload: SheetPayload):
+    wid = active_workflow_id(payload.workflow_id)
+    try:
+        rows = sheets.fetch(payload.url.strip())
+    except sheets.SheetError as exc:
+        raise HTTPException(400, str(exc))
+
+    inserted, skipped = db.add_records(wid, rows, source="sheet")
+    return {
+        "inserted": inserted,
+        "skipped_duplicates": skipped,
+        "columns": list(rows[0].keys()),
+    }
 
 
 @app.delete("/api/records/{record_id}")
@@ -407,6 +499,37 @@ def analytics():
 
 # -- integrations ------------------------------------------------------------
 
+@app.post("/api/notify/test")
+def notify_test():
+    url = (db.get_setting("notify_webhook_url", "") or "").strip()
+    if not url:
+        raise HTTPException(400, "No webhook URL is set.")
+    ok = notify.send(
+        "FlowPilot test",
+        "If you are reading this, notifications are working.",
+    )
+    if not ok:
+        raise HTTPException(
+            502, "The webhook did not accept the message. Check the URL."
+        )
+    return {"ok": True}
+
+
+@app.get("/api/evidence")
+def evidence_status():
+    usage = db.evidence_usage()
+    return {
+        **usage,
+        "megabytes": round(usage["bytes"] / 1048576, 1),
+        "retention_days": db.get_setting("evidence_retention_days", "14"),
+    }
+
+
+@app.post("/api/evidence/prune")
+def evidence_prune():
+    return {"removed_runs": db.prune_evidence(), **db.evidence_usage()}
+
+
 @app.get("/api/integrations")
 def integrations():
     workflows = db.list_workflows()
@@ -470,14 +593,18 @@ async def websocket_endpoint(ws: WebSocket):
 
 @app.middleware("http")
 async def revalidate_frontend(request, call_next):
-    """Keep the dashboard assets out of the browser cache.
+    """Keep the dashboard out of the browser cache.
 
-    Without this a client keeps running an old app.js after an update and reports
-    bugs that were already fixed.
+    Assets, because a client otherwise keeps running an old app.js after an
+    update and reports bugs that were already fixed. API responses, because a
+    cached one shows stale state: a cached /api/auth/status will offer the
+    first-run setup screen on an instance that already has a password.
     """
     response = await call_next(request)
     path = request.url.path
-    if path in ("/", "/index.html") or path.endswith((".js", ".css")):
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    elif path in ("/", "/index.html", "/login") or path.endswith((".js", ".css")):
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
 

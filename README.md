@@ -9,14 +9,35 @@ Everything runs on your machine. No hosting, no accounts, no data leaves the com
 ## What it does
 
 - **Workflows** are declarative step lists (`goto`, `fill`, `click`, `wait_for`,
-  `assert_text`, `extract`) with `{{field}}` templating from each record.
-- **Records** come from CSV or the API. Duplicates are rejected on a unique key.
+  `assert_text`, `extract`) with `{{field}}` templating from each record. Build them
+  with the step builder or edit the JSON directly.
+- **Records** come from CSV, a Google Sheet shared as view-by-link, or the API.
+  Duplicates are rejected on a unique key, so re-importing is safe.
 - **Runs** process a configurable batch, pacing themselves between records, with a
   circuit breaker that halts the run after N consecutive failures.
-- **Evidence** is a screenshot after every step plus any extracted values, kept per run.
+- **Schedules** start a run on their own, every N minutes or once a day, but only
+  when the queue has pending records and nothing else is running.
+- **Notifications** post to a webhook when a run finishes, when records need review,
+  or when a run fails. Works with ntfy.sh, Slack, Discord or any JSON endpoint.
+- **Evidence** is a screenshot after every step plus any extracted values, kept per
+  run and pruned automatically once past the retention window.
 - **Review Center** holds anything uncertain. Nothing uncertain is ever retried
   automatically, so a record cannot be submitted twice by accident.
 - **Analytics** covers outcomes, error categories and processing time.
+
+A run interrupted by a crash or reboot is closed out on the next start and its
+records returned to pending, rather than being left stuck mid-flight forever.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -q
+```
+
+58 tests covering the engine's logic, the API surface, authentication, scheduling,
+migrations and retention. No browser or network needed, so they run in CI on every
+push (see `.github/workflows/tests.yml`).
 
 ## What it will not do
 
@@ -114,27 +135,37 @@ history are kept.
 
 | Screen | Purpose |
 |---|---|
-| Overview | Stats, run controls, live progress, recent activity |
-| Automation Studio | Create workflows and record authorization |
-| Record Queue | Import CSV, filter, reset or delete records |
+| Overview | Stats, workflow picker, run controls, live progress |
+| Automation Studio | Create, edit, delete and schedule workflows |
+| Record Queue | Import from CSV or Google Sheets, filter, reset, delete |
 | Live Browser | Per-step screenshots, step timeline, event log |
 | Run History | Every batch, drill-down detail, CSV export |
 | Review Center | Approve or requeue uncertain outcomes |
 | Analytics | Daily outcomes, success rate, error categories |
-| Integrations | Allowlist status and local storage paths |
-| Settings | Pacing, timeouts, safety toggles, allowed domains |
+| Integrations | Allowlist, scheduler state, evidence disk usage |
+| Settings | Pacing, retention, notifications, allowed domains, password |
 
 ## Layout
 
 ```
 backend/
-  app.py       FastAPI routes and WebSocket
-  db.py        SQLite schema and queries
-  runner.py    Playwright engine, allowlist and robots.txt enforcement
+  app.py        FastAPI routes, auth middleware, WebSocket
+  auth.py       Password hashing and sessions
+  db.py         SQLite schema, migrations, queries
+  runner.py     Playwright engine, allowlist and robots.txt enforcement
+  scheduler.py  Scheduled runs and housekeeping
+  notify.py     Webhook notifications
+  sheets.py     Google Sheets import
 frontend/
-  index.html   Shell
-  styles.css   Design system (light and dark)
-  app.js       Router and all nine screens
-flowpilot.db   Created on first run
-evidence/      Screenshots, one folder per run
+  index.html    Dashboard shell
+  login.html    Sign-in and first-run setup
+  styles.css    Design system (light and dark)
+  app.js        Router and all nine screens
+  login.js      Auth page
+deploy/
+  install.sh    One-command server install
+  update.sh     Pull and restart
+tests/          Unit and API tests
+flowpilot.db    Created on first run
+evidence/       Screenshots, one folder per run
 ```

@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 import db
+import notify
 
 TEMPLATE_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 
@@ -133,7 +134,7 @@ class Engine:
 
     # -- control -------------------------------------------------------------
 
-    async def start(self, workflow_id, batch_size):
+    async def start(self, workflow_id, batch_size, trigger="manual"):
         if self.status in ("running", "paused"):
             raise RuntimeError("A run is already in progress.")
 
@@ -158,7 +159,7 @@ class Engine:
         if not records:
             raise ValueError("No pending records for this workflow.")
 
-        self.run_id = db.create_run(workflow_id, batch_size, len(records))
+        self.run_id = db.create_run(workflow_id, batch_size, len(records), trigger)
         self.workflow_id = workflow_id
         self.status = "running"
         self._consecutive_failures = 0
@@ -258,6 +259,27 @@ class Engine:
         self.log(f"Run #{run_id} finished with status '{final}'.")
         self.emit("state", self.snapshot(), persist=False)
         self.emit("run_finished", {"run_id": run_id, "status": final}, persist=False)
+        self._notify_finished(run_id, final, workflow["name"])
+
+    def _notify_finished(self, run_id, status, workflow_name):
+        totals = db.get_run(run_id) or {}
+        completed = totals.get("completed", 0)
+        failed = totals.get("failed", 0)
+        review = totals.get("review", 0)
+
+        summary = (
+            f"{workflow_name}\n"
+            f"{completed} completed, {review} need review, {failed} failed."
+        )
+
+        if status == "failed" and notify.enabled_for("failure"):
+            notify.send_async(f"FlowPilot: run #{run_id} failed", summary)
+        elif review and notify.enabled_for("review"):
+            notify.send_async(
+                f"FlowPilot: {review} record(s) need review", summary
+            )
+        elif notify.enabled_for("finish"):
+            notify.send_async(f"FlowPilot: run #{run_id} {status}", summary)
 
     async def _process_record(
         self, page, workflow, record, index, total,
