@@ -41,14 +41,18 @@ else
 fi
 
 say "Fetching FlowPilot into $APP_DIR"
+# Git refuses to work on a repository owned by another user, so every git call
+# runs as the account that owns the checkout.
 if [ -d "$APP_DIR/.git" ]; then
-    git -C "$APP_DIR" fetch --quiet origin
-    git -C "$APP_DIR" reset --hard --quiet origin/main
-    info "updated to the latest commit"
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+    sudo -u "$APP_USER" git -C "$APP_DIR" fetch --quiet origin
+    sudo -u "$APP_USER" git -C "$APP_DIR" reset --hard --quiet origin/main
+    info "updated to $(sudo -u "$APP_USER" git -C "$APP_DIR" log --oneline -1)"
 else
     mkdir -p "$APP_DIR"
-    git clone --quiet "$REPO" "$APP_DIR"
-    info "cloned"
+    chown "$APP_USER:$APP_USER" "$APP_DIR"
+    sudo -u "$APP_USER" git clone --quiet "$REPO" "$APP_DIR"
+    info "cloned $(sudo -u "$APP_USER" git -C "$APP_DIR" log --oneline -1)"
 fi
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 

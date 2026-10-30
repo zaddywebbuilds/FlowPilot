@@ -18,16 +18,21 @@ die()  { printf '\n\033[1;31mError:\033[0m %s\n\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "Run this as root:  sudo bash update.sh"
 [ -d "$APP_DIR/.git" ] || die "No FlowPilot install at $APP_DIR. Run install.sh first."
 
+# Git refuses to work on a repository owned by another user, so every git call
+# runs as the account that owns the checkout.
+chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+as_app() { sudo -u "$APP_USER" git -C "$APP_DIR" "$@"; }
+
 say "Current version"
-info "$(git -C "$APP_DIR" log --oneline -1)"
+info "$(as_app log --oneline -1)"
 
 say "Fetching latest"
-git -C "$APP_DIR" fetch --quiet origin
-if [ -z "$(git -C "$APP_DIR" log HEAD..origin/main --oneline)" ]; then
+as_app fetch --quiet origin
+if [ -z "$(as_app log HEAD..origin/main --oneline)" ]; then
     info "already up to date"
 else
-    git -C "$APP_DIR" log HEAD..origin/main --oneline | sed 's/^/    /'
-    git -C "$APP_DIR" reset --hard --quiet origin/main
+    as_app log HEAD..origin/main --oneline | sed 's/^/    /'
+    as_app reset --hard --quiet origin/main
     chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 fi
 
@@ -40,5 +45,5 @@ say "Restarting"
 systemctl restart flowpilot
 sleep 2
 systemctl is-active --quiet flowpilot || die "Service failed to start. Check: journalctl -u flowpilot -n 50"
-info "running: $(git -C "$APP_DIR" log --oneline -1)"
+info "running: $(as_app log --oneline -1)"
 echo
