@@ -74,6 +74,13 @@ python -m venv .venv
 .venv\Scripts\python -m uvicorn app:app --app-dir backend --port 8000
 ```
 
+## Handing it to someone else
+
+Settings → Access → **Generate a handover password**. It replaces the current
+password with a one-time one, shows it once, and signs you out. Send them the link
+and that password; the first time they sign in they are made to choose their own
+before anything else is reachable, and the handover password stops working.
+
 ## First run
 
 You are asked to create a password. That password protects the dashboard, and

@@ -123,6 +123,7 @@ DEFAULT_SETTINGS = {
     "browser_channel": "chrome",
     "headless": "0",
     "session_days": "14",
+    "password_is_temporary": "0",
     "evidence_retention_days": "14",
     "scheduler_enabled": "1",
     "notify_webhook_url": "",

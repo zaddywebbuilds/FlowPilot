@@ -1620,10 +1620,47 @@ RENDERERS.settings = async () => {
           <div class="field"><label>Confirm new password</label>
             <input type="password" id="newPasswordConfirm" autocomplete="new-password"></div>
           <button class="btn" id="changePassword">Change password</button>
+
+          <div style="margin-top:22px;padding-top:18px;border-top:1px solid var(--border)">
+            <strong style="font-size:13px">Hand this over to someone else</strong>
+            <div class="hint" style="margin:5px 0 11px">
+              Generates a one-time password to send them. They must choose their own
+              before they can use anything. You will be signed out.</div>
+            <button class="btn" id="handover">Generate a handover password</button>
+            <div id="handoverResult"></div>
+          </div>
         </div>
       </div>
     </div>
   </div>`;
+
+  $('#handover').onclick = async () => {
+    if (!window.confirm(
+      'Generate a handover password?\n\nThis replaces the current password and signs '
+      + 'you out. Whoever you send it to will be asked to set their own.'
+    )) return;
+
+    const btn = $('#handover');
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+    try {
+      const r = await api('/auth/handover', { method: 'POST' });
+      // Shown once: only the hash is kept, so it cannot be looked up later.
+      $('#handoverResult').innerHTML = `
+        <div class="notice warn" style="margin-top:14px">${ICON.alert}
+          <div><strong>Send them this, it is shown once</strong>
+            <div class="mono" style="font-size:16px;margin:8px 0;user-select:all">${esc(r.password)}</div>
+            You are now signed out. They will be asked to choose their own password
+            the first time they sign in.</div></div>
+        <button class="btn primary" id="handoverDone" style="margin-top:10px">Done</button>`;
+      $('#handoverDone').onclick = () => { location.href = '/login'; };
+      btn.remove();
+    } catch (e) {
+      toast(e.message, 'error');
+      btn.disabled = false;
+      btn.textContent = 'Generate a handover password';
+    }
+  };
 
   $('#testNotify').onclick = async () => {
     const btn = $('#testNotify');

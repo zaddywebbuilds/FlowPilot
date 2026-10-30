@@ -22,10 +22,33 @@ function showError(message) {
   errorBox.style.display = message ? 'block' : 'none';
 }
 
+function asNewPasswordForm(title, sub, label, hint, button) {
+  document.getElementById('authTitle').textContent = title;
+  document.getElementById('authSub').textContent = sub;
+  document.getElementById('passwordLabel').textContent = label;
+  document.getElementById('passwordHint').textContent = hint;
+  password.setAttribute('autocomplete', 'new-password');
+  confirmField.style.display = 'block';
+  confirm.required = true;
+  submit.textContent = button;
+}
+
 async function detectMode() {
   try {
     const res = await fetch('/api/auth/status');
     const status = await res.json();
+
+    if (status.authenticated && status.must_change) {
+      mode = 'password';
+      asNewPasswordForm(
+        'Choose your password',
+        'You signed in with a temporary password. Pick your own to continue.',
+        'Your new password',
+        'At least 8 characters.',
+        'Save and continue',
+      );
+      return;
+    }
 
     if (status.authenticated) {
       location.href = '/';
@@ -34,15 +57,13 @@ async function detectMode() {
 
     if (!status.configured) {
       mode = 'setup';
-      document.getElementById('authTitle').textContent = 'Create a password';
-      document.getElementById('authSub').textContent =
-        'First run. Choose the password you will use to reach this dashboard.';
-      document.getElementById('passwordLabel').textContent = 'New password';
-      document.getElementById('passwordHint').textContent = 'At least 8 characters.';
-      password.setAttribute('autocomplete', 'new-password');
-      confirmField.style.display = 'block';
-      confirm.required = true;
-      submit.textContent = 'Create password';
+      asNewPasswordForm(
+        'Create a password',
+        'First run. Choose the password you will use to reach this dashboard.',
+        'New password',
+        'At least 8 characters.',
+        'Create password',
+      );
     }
   } catch {
     showError('Cannot reach the server. Is FlowPilot running?');
@@ -53,13 +74,19 @@ form.addEventListener('submit', async (event) => {
   event.preventDefault();
   showError('');
 
-  if (mode === 'setup') {
+  const BUTTONS = {
+    setup: ['Create password', 'Creating...'],
+    password: ['Save and continue', 'Saving...'],
+    login: ['Sign in', 'Signing in...'],
+  };
+
+  if (mode !== 'login') {
     if (password.value.length < 8) return showError('Password must be at least 8 characters.');
     if (password.value !== confirm.value) return showError('Those passwords do not match.');
   }
 
   submit.disabled = true;
-  submit.textContent = mode === 'setup' ? 'Creating...' : 'Signing in...';
+  submit.textContent = BUTTONS[mode][1];
 
   try {
     const res = await fetch(`/api/auth/${mode}`, {
@@ -80,7 +107,7 @@ form.addEventListener('submit', async (event) => {
   }
 
   submit.disabled = false;
-  submit.textContent = mode === 'setup' ? 'Create password' : 'Sign in';
+  submit.textContent = BUTTONS[mode][0];
   password.select();
 });
 

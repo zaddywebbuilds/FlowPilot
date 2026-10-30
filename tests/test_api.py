@@ -56,7 +56,9 @@ def test_login_assets_stay_public(client):
 
 def test_status_endpoint_reports_unconfigured(client):
     body = client.get("/api/auth/status").json()
-    assert body == {"configured": False, "authenticated": False}
+    assert body["configured"] is False
+    assert body["authenticated"] is False
+    assert body["must_change"] is False
 
 
 # -- setup and login ---------------------------------------------------------
@@ -310,6 +312,47 @@ def test_evidence_endpoint_reports_usage(client):
 
 def test_evidence_prune_is_safe_to_call(client):
     assert client.post("/api/evidence/prune").status_code == 200
+
+
+# -- handover ----------------------------------------------------------------
+
+def test_handover_forces_the_next_person_to_set_their_own_password(client):
+    """The whole point: a handover password gets you only as far as replacing it."""
+    from fastapi.testclient import TestClient
+
+    import app as app_module
+
+    handed = client.post("/api/auth/handover").json()
+    temporary = handed["password"]
+    assert len(temporary) >= 8
+
+    # The previous owner is signed out by the handover.
+    assert client.get("/api/overview").status_code == 401
+
+    with TestClient(app_module.app) as newcomer:
+        assert newcomer.post("/api/auth/login", json={"password": temporary}).status_code == 200
+
+        status = newcomer.get("/api/auth/status").json()
+        assert status["authenticated"] is True
+        assert status["must_change"] is True
+
+        # Signed in, but the dashboard is closed until a real password is set.
+        assert newcomer.get("/api/overview").status_code == 403
+        assert newcomer.get("/", follow_redirects=False).status_code == 303
+
+        newcomer.post("/api/auth/password", json={"password": "their-own-password"})
+
+        assert newcomer.get("/api/auth/status").json()["must_change"] is False
+        assert newcomer.get("/api/overview").status_code == 200
+
+    # The temporary password is dead once replaced.
+    with TestClient(app_module.app) as stranger:
+        assert stranger.post("/api/auth/login", json={"password": temporary}).status_code == 401
+
+    # Put the shared fixture back as the later tests expect to find it.
+    client.post("/api/auth/login", json={"password": "their-own-password"})
+    client.post("/api/auth/password", json={"password": PASSWORD})
+    assert client.get("/api/overview").status_code == 200
 
 
 # -- logout ------------------------------------------------------------------

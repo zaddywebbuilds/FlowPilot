@@ -22,14 +22,32 @@ def _hash_password(password: str, salt: bytes) -> str:
     return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${digest.hex()}"
 
 
-def set_password(password: str) -> None:
+def set_password(password: str, temporary: bool = False) -> None:
     if len(password) < MIN_PASSWORD_LENGTH:
         raise ValueError(
             f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
         )
     db.set_setting("auth_password", _hash_password(password, secrets.token_bytes(16)))
+    db.set_setting("password_is_temporary", "1" if temporary else "0")
     # Any existing session was issued against the old password.
     db.execute("DELETE FROM sessions")
+
+
+def must_change_password() -> bool:
+    """True while the current password is a handover one that has to be replaced."""
+    return db.get_setting("password_is_temporary", "0") == "1"
+
+
+def generate_temporary_password() -> str:
+    """A readable one-time password for handing over in a message.
+
+    Deliberately not random hex: this gets typed by a person reading it off a
+    chat window, so it avoids characters that look alike.
+    """
+    alphabet = "abcdefghijkmnpqrstuvwxyz23456789"
+    return "-".join(
+        "".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)
+    )
 
 
 def is_configured() -> bool:

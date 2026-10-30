@@ -153,6 +153,9 @@ PUBLIC_PATHS = {
     "/api/auth/login",
 }
 
+# Reachable while signed in with a handover password, and nothing else.
+PASSWORD_CHANGE_PATHS = {"/api/auth/password", "/api/auth/logout"}
+
 
 @app.middleware("http")
 async def require_login(request: Request, call_next):
@@ -168,6 +171,14 @@ async def require_login(request: Request, call_next):
         return RedirectResponse("/login", status_code=303)
 
     if auth.validate_token(request.cookies.get(auth.COOKIE_NAME)):
+        # A handover password gets you exactly as far as replacing it.
+        if auth.must_change_password() and path not in PASSWORD_CHANGE_PATHS:
+            if path.startswith("/api/") or path == "/ws":
+                return JSONResponse(
+                    {"detail": "Set your own password before using the dashboard."},
+                    status_code=403,
+                )
+            return RedirectResponse("/login", status_code=303)
         return await call_next(request)
 
     if path.startswith("/api/") or path == "/ws":
@@ -190,7 +201,24 @@ def auth_status(request: Request):
     return {
         "configured": auth.is_configured(),
         "authenticated": auth.validate_token(request.cookies.get(auth.COOKIE_NAME)),
+        "must_change": auth.must_change_password(),
     }
+
+
+@app.post("/api/auth/handover")
+def auth_handover(request: Request):
+    """Replace the password with a one-time one for handing the box to someone.
+
+    Returned once and never stored in the clear, so it cannot be recovered later:
+    if it is lost, generate another.
+    """
+    temporary = auth.generate_temporary_password()
+    # set_password drops every session, including this one. That is correct:
+    # handing the instance over should sign the previous owner out.
+    auth.set_password(temporary, temporary=True)
+    response = JSONResponse({"password": temporary})
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return response
 
 
 @app.post("/api/auth/setup")
