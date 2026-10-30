@@ -105,6 +105,9 @@ MIGRATIONS = [
     ("workflows", "schedule_batch", "INTEGER NOT NULL DEFAULT 25"),
     ("workflows", "next_run_at", "REAL"),
     ("runs", "trigger", "TEXT NOT NULL DEFAULT 'manual'"),
+    # Cookies captured after a human signed in once. Never a password.
+    ("workflows", "session_state", "TEXT"),
+    ("workflows", "session_saved_at", "REAL"),
 ]
 
 DEFAULT_SETTINGS = {
@@ -290,17 +293,22 @@ def create_workflow(name, description, target_domain, steps, authorized_by):
     )
 
 
+def _public_workflow(wf):
+    """Strip the saved cookies: the dashboard only needs to know one exists."""
+    wf["steps"] = json.loads(wf.pop("steps_json"))
+    wf["has_session"] = bool(wf.pop("session_state", None))
+    return wf
+
+
 def get_workflow(workflow_id):
     wf = query_one("SELECT * FROM workflows WHERE id = ?", (workflow_id,))
-    if wf:
-        wf["steps"] = json.loads(wf.pop("steps_json"))
-    return wf
+    return _public_workflow(wf) if wf else None
 
 
 def list_workflows():
     out = []
     for wf in query("SELECT * FROM workflows ORDER BY id"):
-        wf["steps"] = json.loads(wf.pop("steps_json"))
+        _public_workflow(wf)
         wf["pending"] = count_records(wf["id"]).get("pending", 0)
         out.append(wf)
     return out
@@ -328,10 +336,35 @@ def delete_workflow(workflow_id):
     execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
 
 
+def save_session(workflow_id, state):
+    """Keep the cookies from a sign-in a human did, so runs start logged in."""
+    execute(
+        "UPDATE workflows SET session_state = ?, session_saved_at = ? WHERE id = ?",
+        (json.dumps(state), time.time(), workflow_id),
+    )
+
+
+def clear_session(workflow_id):
+    execute(
+        "UPDATE workflows SET session_state = NULL, session_saved_at = NULL WHERE id = ?",
+        (workflow_id,),
+    )
+
+
+def get_session(workflow_id):
+    row = query_one("SELECT session_state FROM workflows WHERE id = ?", (workflow_id,))
+    if not row or not row["session_state"]:
+        return None
+    try:
+        return json.loads(row["session_state"])
+    except (ValueError, TypeError):
+        return None
+
+
 def scheduled_workflows():
     out = []
     for wf in query("SELECT * FROM workflows WHERE schedule_enabled = 1 ORDER BY id"):
-        wf["steps"] = json.loads(wf.pop("steps_json"))
+        _public_workflow(wf)
         wf["pending"] = count_records(wf["id"]).get("pending", 0)
         out.append(wf)
     return out

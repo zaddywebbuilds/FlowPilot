@@ -338,6 +338,15 @@ def schedule_status():
 
 class PickerOpen(BaseModel):
     url: str
+    workflow_id: int | None = None
+
+
+class PickerText(BaseModel):
+    text: str
+
+
+class PickerKey(BaseModel):
+    key: str
 
 
 class PickerPoint(BaseModel):
@@ -361,7 +370,7 @@ async def picker_open(payload: PickerOpen):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     try:
-        return await picker.open(url)
+        return await picker.open(url, payload.workflow_id)
     except AuthorizationError as exc:
         raise HTTPException(403, str(exc))
     except PickerError as exc:
@@ -386,9 +395,67 @@ async def picker_pick(payload: PickerPoint):
         raise HTTPException(400, str(exc))
 
 
+@app.post("/api/picker/click")
+async def picker_click(payload: PickerPoint):
+    try:
+        return await picker.click(payload.x, payload.y)
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/picker/type")
+async def picker_type(payload: PickerText):
+    try:
+        return await picker.type(payload.text)
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/picker/key")
+async def picker_key(payload: PickerKey):
+    try:
+        return await picker.press(payload.key)
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+
+
 @app.post("/api/picker/close")
 async def picker_close():
     await picker.close()
+    return {"ok": True}
+
+
+# -- saved sign-in -----------------------------------------------------------
+
+@app.post("/api/workflows/{workflow_id}/session")
+async def save_workflow_session(workflow_id: int):
+    """Keep the cookies from the sign-in the operator just did in the picker.
+
+    Only the resulting cookies are stored, never the password that produced them.
+    """
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found.")
+    try:
+        state = await picker.storage_state()
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+
+    cookies = state.get("cookies", [])
+    if not cookies:
+        raise HTTPException(
+            400,
+            "That page set no cookies, so there is no sign-in to save. "
+            "Log in first, then save.",
+        )
+    db.save_session(workflow_id, state)
+    return {"ok": True, "cookies": len(cookies)}
+
+
+@app.delete("/api/workflows/{workflow_id}/session")
+def clear_workflow_session(workflow_id: int):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found.")
+    db.clear_session(workflow_id)
     return {"ok": True}
 
 

@@ -345,7 +345,8 @@ RENDERERS.studio = async () => {
             <td>${w.schedule_enabled
               ? `<span class="chip running">${w.schedule_kind === 'daily'
                   ? esc(w.schedule_at) : `${w.schedule_minutes}m`}</span>`
-              : '<span class="muted">off</span>'}</td>
+              : '<span class="muted">off</span>'}
+              ${w.has_session ? '<span class="chip completed">signed in</span>' : ''}</td>
             <td style="text-align:right;white-space:nowrap">
               <button class="btn sm" data-edit="${w.id}">Edit</button>
               <button class="btn sm" data-del-wf="${w.id}">Delete</button>
@@ -380,6 +381,19 @@ RENDERERS.studio = async () => {
           <div class="hint">The easy way. Loads the site, you click a field or button,
             and the step is written for you.</div>
         </div>
+
+        ${isEdit ? `<div class="field">
+          <label>Sign-in</label>
+          ${editing.has_session
+            ? `<div class="kv" style="padding-top:0">
+                 <span class="chip completed">saved ${fmtTime(editing.session_saved_at)}</span>
+                 <button class="btn sm" id="clearSession">Forget it</button>
+               </div>
+               <div class="hint">Runs start already logged in. If the site signs you
+                 out, open the page above, use the Sign in tab, and save again.</div>`
+            : `<div class="muted" style="font-size:12.5px">No sign-in saved. If the site
+                 needs a login, open the page above and use the <strong>Sign in</strong> tab.</div>`}
+        </div>` : ''}
 
         <details style="margin-bottom:14px">
           <summary class="muted" style="cursor:pointer;font-size:12.5px;padding:4px 0">
@@ -436,10 +450,19 @@ RENDERERS.studio = async () => {
       // A templated URL cannot be loaded as-is, so fall back to the site root.
       if (existing?.url && !existing.url.includes('{{')) seed = existing.url;
     } catch {}
-    openPicker(seed);
+    openPicker(seed, editing.id);
   };
 
   if (isEdit) $('#testWf').onclick = () => runWorkflowTest(editing);
+
+  if ($('#clearSession')) $('#clearSession').onclick = async () => {
+    if (!window.confirm('Forget the saved sign-in? Runs will no longer start logged in.')) return;
+    try {
+      await api(`/workflows/${editing.id}/session`, { method: 'DELETE' });
+      toast('Saved sign-in removed');
+      render();
+    } catch (e) { toast(e.message, 'error'); }
+  };
 
   $('#addStep').onclick = () => {
     const type = $('#stType').value;
@@ -553,11 +576,13 @@ async function runWorkflowTest(workflow) {
 
 // -- element picker ----------------------------------------------------------
 
-const pickerState = { shot: null, picked: null };
+const pickerState = { shot: null, picked: null, mode: 'inspect', workflowId: null };
 
-function openPicker(defaultUrl) {
+function openPicker(defaultUrl, workflowId) {
   pickerState.picked = null;
   pickerState.shot = null;
+  pickerState.mode = 'inspect';
+  pickerState.workflowId = workflowId || null;
 
   const modal = document.createElement('div');
   modal.className = 'modal-backdrop';
@@ -565,11 +590,15 @@ function openPicker(defaultUrl) {
   modal.innerHTML = `
     <div class="modal">
       <div class="modal-head">
-        <h2>Pick from the page</h2>
+        <h2>The page</h2>
         <input type="text" id="pkUrl" value="${esc(defaultUrl || '')}"
                placeholder="https://example.com/login" style="flex:1">
         <button class="btn primary" id="pkLoad">Load</button>
         <button class="btn" id="pkClose">Close</button>
+      </div>
+      <div class="tabs" style="padding:0 18px">
+        <button data-mode="inspect" class="active">Build steps</button>
+        <button data-mode="interact">Sign in</button>
       </div>
       <div class="modal-body">
         <div class="picker-stage" id="pkStage">
@@ -589,7 +618,79 @@ function openPicker(defaultUrl) {
   $('#pkUrl').onkeydown = (e) => { if (e.key === 'Enter') loadPickerPage(); };
   modal.onclick = (e) => { if (e.target === modal) closePicker(); };
 
+  modal.querySelectorAll('[data-mode]').forEach((b) => b.onclick = () => {
+    pickerState.mode = b.dataset.mode;
+    modal.querySelectorAll('[data-mode]').forEach((o) =>
+      o.classList.toggle('active', o.dataset.mode === pickerState.mode));
+    pickerState.picked = null;
+    $('#pkStage').querySelector('.picker-highlight')?.remove();
+    paintFoot();
+  });
+
   if (defaultUrl) loadPickerPage();
+}
+
+function paintFoot() {
+  if (pickerState.mode === 'interact') return paintSignInFoot();
+  if (pickerState.picked) return paintPicked(pickerState.picked);
+  $('#pkFoot').innerHTML =
+    `<div class="muted" style="font-size:12.5px">Click an element on the page above.</div>`;
+}
+
+function paintSignInFoot() {
+  $('#pkFoot').innerHTML = `
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="text" id="pkTypeText" placeholder="Type here, then press Send"
+             style="flex:1;min-width:180px">
+      <button class="btn" id="pkSend">Send</button>
+      <button class="btn sm" id="pkEnter">Enter</button>
+      <button class="btn sm" id="pkTab">Tab</button>
+      <div class="spacer"></div>
+      <button class="btn primary" id="pkSaveSession"
+        ${pickerState.workflowId ? '' : 'disabled'}>Save this sign-in</button>
+    </div>
+    <div class="hint" style="margin-top:8px">
+      Clicks here go through to the real page. Sign in as you normally would, then save.
+      Only the resulting cookies are stored, never your password.
+    </div>`;
+
+  $('#pkSend').onclick = async () => {
+    const text = $('#pkTypeText').value;
+    if (!text) return;
+    try {
+      pickerState.shot = await api('/picker/type', {
+        method: 'POST', body: JSON.stringify({ text }),
+      });
+      $('#pkTypeText').value = '';
+      paintPicker();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  $('#pkTypeText').onkeydown = (e) => { if (e.key === 'Enter') $('#pkSend').click(); };
+  $('#pkEnter').onclick = () => pressPickerKey('Enter');
+  $('#pkTab').onclick = () => pressPickerKey('Tab');
+  $('#pkSaveSession').onclick = saveSignIn;
+}
+
+async function pressPickerKey(key) {
+  try {
+    pickerState.shot = await api('/picker/key', {
+      method: 'POST', body: JSON.stringify({ key }),
+    });
+    paintPicker();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function saveSignIn() {
+  const btn = $('#pkSaveSession');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    const r = await api(`/workflows/${pickerState.workflowId}/session`, { method: 'POST' });
+    toast(`Sign-in saved (${r.cookies} cookies). Runs will start logged in.`, 'success');
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+  btn.disabled = false;
+  btn.textContent = 'Save this sign-in';
 }
 
 async function closePicker() {
@@ -622,7 +723,8 @@ async function loadPickerPage() {
 
   try {
     pickerState.shot = await api('/picker/open', {
-      method: 'POST', body: JSON.stringify({ url }),
+      method: 'POST',
+      body: JSON.stringify({ url, workflow_id: pickerState.workflowId }),
     });
     clearInterval(tick);
     // Sites redirect, so show where we actually landed rather than what was typed.
@@ -660,6 +762,14 @@ function paintPicker() {
     const y = (event.clientY - rect.top) * scale;
 
     try {
+      if (pickerState.mode === 'interact') {
+        // Goes through to the real page, so the operator can work a sign-in.
+        pickerState.shot = await api('/picker/click', {
+          method: 'POST', body: JSON.stringify({ x, y }),
+        });
+        paintPicker();
+        return;
+      }
       const found = await api('/picker/pick', {
         method: 'POST', body: JSON.stringify({ x, y }),
       });
@@ -668,6 +778,8 @@ function paintPicker() {
       paintPicked(found);
     } catch (e) { toast(e.message, 'error'); }
   };
+
+  paintFoot();
 }
 
 function highlightPicked(found, ratio) {

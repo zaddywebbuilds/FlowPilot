@@ -102,15 +102,17 @@ class Picker:
     def __init__(self):
         self._pw = None
         self._browser = None
+        self._context = None
         self._page = None
         self._lock = asyncio.Lock()
         self.url = None
+        self.workflow_id = None
 
     @property
     def is_open(self):
         return self._page is not None
 
-    async def open(self, url):
+    async def open(self, url, workflow_id=None):
         check_host_allowed(url)
         if db.get_setting("respect_robots_txt", "1") == "1" and not robots_allows(url):
             raise PickerError(f"robots.txt disallows automated access to {url}")
@@ -125,14 +127,59 @@ class Picker:
                     settings.get("browser_channel", "chrome") or None,
                     True,  # always headless: the operator sees the screenshot
                 )
-                context = await self._browser.new_context(viewport=VIEWPORT)
-                self._page = await context.new_page()
+                # Start from the saved sign-in so the operator can see whether it
+                # is still valid, and so a fresh one replaces it cleanly.
+                self._context = await self._browser.new_context(
+                    viewport=VIEWPORT,
+                    storage_state=db.get_session(workflow_id) if workflow_id else None,
+                )
+                self._page = await self._context.new_page()
                 await self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 self.url = url
+                self.workflow_id = workflow_id
             except Exception:
                 await self._close_locked()
                 raise
             return await self._shot_locked()
+
+    async def click(self, x, y):
+        """A real click, so the operator can work through a sign-in."""
+        async with self._lock:
+            self._require_page()
+            await self._page.mouse.click(x, y)
+            await self._settle()
+            return await self._shot_locked()
+
+    async def type(self, text):
+        async with self._lock:
+            self._require_page()
+            await self._page.keyboard.type(text, delay=15)
+            return await self._shot_locked()
+
+    async def press(self, key):
+        async with self._lock:
+            self._require_page()
+            if key not in ("Enter", "Tab", "Escape", "Backspace"):
+                raise PickerError(f"Key '{key}' is not allowed.")
+            await self._page.keyboard.press(key)
+            await self._settle()
+            return await self._shot_locked()
+
+    async def storage_state(self):
+        """The cookies for whatever the operator is now signed into."""
+        async with self._lock:
+            self._require_page()
+            if not self._context:
+                raise PickerError("No browser session is open.")
+            return await self._context.storage_state()
+
+    async def _settle(self):
+        """Give a click or keypress a moment to navigate before screenshotting."""
+        try:
+            await self._page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(0.4)
 
     async def scroll(self, direction):
         async with self._lock:
@@ -186,8 +233,10 @@ class Picker:
                     pass
         self._pw = None
         self._browser = None
+        self._context = None
         self._page = None
         self.url = None
+        self.workflow_id = None
 
 
 picker = Picker()

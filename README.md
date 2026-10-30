@@ -15,6 +15,9 @@ Everything runs on your machine. No hosting, no accounts, no data leaves the com
   you. Steps can still be edited as JSON.
 - **Test on one record** walks a workflow through a single record and reports each
   step with a screenshot, so a broken selector is found before a queue runs on it.
+- **Sites that need a login** are handled by signing in once inside the picker and
+  saving the session. Only the resulting cookies are kept, never the password, and
+  they are never sent back to the browser.
 - **Records** come from CSV, a Google Sheet shared as view-by-link, or the API.
   Duplicates are rejected on a unique key, so re-importing is safe.
 - **Runs** process a configurable batch, pacing themselves between records, with a

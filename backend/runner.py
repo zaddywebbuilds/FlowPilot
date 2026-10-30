@@ -207,8 +207,15 @@ class Engine:
         try:
             async with async_playwright() as pw:
                 browser, channel = await launch_browser(pw, preferred, headless)
-                self.log(f"Browser ready ({channel}).")
-                context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                saved = db.get_session(workflow["id"])
+                if saved:
+                    self.log(f"Browser ready ({channel}), using the saved sign-in.")
+                else:
+                    self.log(f"Browser ready ({channel}).")
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    storage_state=saved,
+                )
                 page = await context.new_page()
 
                 for index, record in enumerate(records, start=1):
@@ -472,7 +479,10 @@ async def test_workflow(workflow, data):
     async with async_playwright() as pw:
         try:
             browser, channel = await launch_browser(pw, preferred, True)
-            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                storage_state=db.get_session(workflow.get("id")) if workflow.get("id") else None,
+            )
             page = await context.new_page()
 
             for n, step in enumerate(workflow["steps"], start=1):

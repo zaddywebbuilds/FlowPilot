@@ -1,5 +1,6 @@
 """Unit tests. No browser, no server, no network: these run anywhere."""
 
+import json
 import os
 import sys
 import time
@@ -345,6 +346,51 @@ def test_retention_of_zero_keeps_everything(fresh_db):
     fresh_db.set_setting("evidence_retention_days", "0")
     assert fresh_db.prune_old_data()["runs"] == 0
     assert folder.exists()
+
+
+# -- saved sign-in -----------------------------------------------------------
+
+SAMPLE_STATE = {
+    "cookies": [{"name": "sessionid", "value": "super-secret-token", "domain": "x.test"}],
+    "origins": [],
+}
+
+
+def test_session_round_trip(fresh_db):
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    assert fresh_db.get_session(wf) is None
+
+    fresh_db.save_session(wf, SAMPLE_STATE)
+    assert fresh_db.get_session(wf)["cookies"][0]["value"] == "super-secret-token"
+
+    fresh_db.clear_session(wf)
+    assert fresh_db.get_session(wf) is None
+
+
+def test_saved_cookies_never_appear_in_the_public_workflow(fresh_db):
+    """The dashboard must only learn that a session exists, not what it is."""
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    fresh_db.save_session(wf, SAMPLE_STATE)
+
+    for payload in (fresh_db.get_workflow(wf), fresh_db.list_workflows()[0]):
+        assert payload["has_session"] is True
+        assert "session_state" not in payload
+        assert "super-secret-token" not in json.dumps(payload)
+
+
+def test_scheduled_workflows_also_hide_cookies(fresh_db):
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    fresh_db.save_session(wf, SAMPLE_STATE)
+    fresh_db.update_workflow(wf, schedule_enabled=1)
+
+    listed = fresh_db.scheduled_workflows()[0]
+    assert "super-secret-token" not in json.dumps(listed)
+
+
+def test_a_corrupt_session_is_treated_as_absent(fresh_db):
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    fresh_db.execute("UPDATE workflows SET session_state = ? WHERE id = ?", ("not json", wf))
+    assert fresh_db.get_session(wf) is None
 
 
 # -- workflow scoping --------------------------------------------------------

@@ -234,6 +234,39 @@ def test_picker_close_is_safe_when_nothing_is_open(client):
     assert client.post("/api/picker/close").status_code == 200
 
 
+# -- saved sign-in -----------------------------------------------------------
+
+def test_saving_a_session_without_an_open_picker_is_refused(client):
+    wf = client.get("/api/workflows").json()[0]
+    assert client.post(f"/api/workflows/{wf['id']}/session").status_code == 400
+
+
+def test_session_endpoints_404_for_an_unknown_workflow(client):
+    assert client.post("/api/workflows/99999/session").status_code == 404
+    assert client.delete("/api/workflows/99999/session").status_code == 404
+
+
+def test_cookies_are_never_served_to_the_browser(client):
+    """Saved cookies are a credential; the API must only report that one exists."""
+    import db as db_module
+
+    wf = client.get("/api/workflows").json()[0]
+    db_module.save_session(wf["id"], {
+        "cookies": [{"name": "sid", "value": "do-not-leak-me", "domain": "x.test"}],
+        "origins": [],
+    })
+
+    for path in ("/api/workflows", f"/api/overview?workflow_id={wf['id']}", "/api/schedule"):
+        body = client.get(path).text
+        assert "do-not-leak-me" not in body, path
+        assert "session_state" not in body, path
+
+    assert client.get("/api/workflows").json()[0]["has_session"] is True
+
+    client.delete(f"/api/workflows/{wf['id']}/session")
+    assert client.get("/api/workflows").json()[0]["has_session"] is False
+
+
 # -- test a workflow ---------------------------------------------------------
 
 def test_workflow_test_refuses_an_unlisted_target(client):
