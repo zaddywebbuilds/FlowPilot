@@ -208,6 +208,56 @@ def test_run_is_refused_when_the_queue_is_empty(client):
     client.delete(f"/api/workflows/{wf['id']}")
 
 
+# -- element picker ----------------------------------------------------------
+# These assert the guards, which all run before a browser is launched, so the
+# suite stays browser-free.
+
+def test_picker_refuses_a_host_that_is_not_allowlisted(client):
+    r = client.post("/api/picker/open", json={"url": "https://not-allowed.test/login"})
+    assert r.status_code == 403
+    assert "allowed domains" in r.json()["detail"]
+
+
+def test_picker_refuses_an_internal_address(client):
+    """The picker fetches server-side, so it must honour the allowlist too."""
+    for url in ("http://169.254.169.254/latest/meta-data/",
+                "https://10.0.0.1/admin"):
+        r = client.post("/api/picker/open", json={"url": url})
+        assert r.status_code == 403, url
+
+
+def test_picking_without_an_open_page_is_refused(client):
+    assert client.post("/api/picker/pick", json={"x": 10, "y": 10}).status_code == 400
+
+
+def test_picker_close_is_safe_when_nothing_is_open(client):
+    assert client.post("/api/picker/close").status_code == 200
+
+
+# -- test a workflow ---------------------------------------------------------
+
+def test_workflow_test_refuses_an_unlisted_target(client):
+    wf = client.get("/api/workflows").json()[0]
+    r = client.post(f"/api/workflows/{wf['id']}/test", json={
+        "target_domain": "not-allowed.test",
+        "steps": [{"type": "goto", "url": "https://not-allowed.test/"}],
+        "data": {},
+    })
+    assert r.status_code == 403
+
+
+def test_workflow_test_rejects_an_empty_step_list(client):
+    """An empty editor must be an error, not a silent test of the saved steps."""
+    wf = client.get("/api/workflows").json()[0]
+    r = client.post(f"/api/workflows/{wf['id']}/test", json={"steps": []})
+    assert r.status_code == 400
+    assert "no steps" in r.json()["detail"]
+
+
+def test_workflow_test_404s_for_an_unknown_workflow(client):
+    assert client.post("/api/workflows/99999/test", json={}).status_code == 404
+
+
 # -- settings and housekeeping -----------------------------------------------
 
 def test_settings_round_trip(client):

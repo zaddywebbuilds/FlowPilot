@@ -9,8 +9,12 @@ Everything runs on your machine. No hosting, no accounts, no data leaves the com
 ## What it does
 
 - **Workflows** are declarative step lists (`goto`, `fill`, `click`, `wait_for`,
-  `assert_text`, `extract`) with `{{field}}` templating from each record. Build them
-  with the step builder or edit the JSON directly.
+  `assert_text`, `extract`) with `{{field}}` templating from each record.
+- **The element picker** builds them without anyone writing a selector: it opens the
+  target page, you click the field or button you mean, and the step is written for
+  you. Steps can still be edited as JSON.
+- **Test on one record** walks a workflow through a single record and reports each
+  step with a screenshot, so a broken selector is found before a queue runs on it.
 - **Records** come from CSV, a Google Sheet shared as view-by-link, or the API.
   Duplicates are rejected on a unique key, so re-importing is safe.
 - **Runs** process a configurable batch, pacing themselves between records, with a

@@ -395,6 +395,55 @@ tbody tr:hover { background: var(--surface-2); }
 .toast.success { border-left-color: var(--green); }
 @keyframes slide { from { opacity: 0; transform: translateX(16px); } }
 
+/* element picker ----------------------------------------------------------- */
+
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(10, 12, 24, .62);
+  display: grid; place-items: center; padding: 24px;
+  animation: fade .14s ease;
+}
+@keyframes fade { from { opacity: 0; } }
+
+.modal {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 16px; box-shadow: 0 24px 64px rgba(0,0,0,.3);
+  width: 100%; max-width: 1080px; max-height: 92vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+}
+.modal-head h2 { margin: 0; font-size: 15px; font-weight: 640; white-space: nowrap; }
+.modal-body { padding: 16px 18px; overflow-y: auto; flex: 1; }
+.modal-foot {
+  padding: 14px 18px; border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.picker-stage {
+  position: relative; border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; background: #0d0f1c; min-height: 220px;
+  display: grid; place-items: center;
+}
+.picker-stage img { width: 100%; display: block; cursor: crosshair; }
+.picker-stage .placeholder { color: #5d6388; font-size: 13px; padding: 60px 20px; text-align: center; line-height: 1.7; }
+.picker-highlight {
+  position: absolute; border: 2px solid var(--accent);
+  background: rgba(124,92,255,.18); pointer-events: none;
+  border-radius: 3px; transition: all .1s;
+}
+.picker-hint {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--muted); margin: 10px 0 0;
+}
+.picked {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 13px 15px;
+}
+.picked .mono { word-break: break-all; }
+
 /* login -------------------------------------------------------------------- */
 
 .auth-body { display: grid; place-items: center; min-height: 100vh; padding: 24px; }

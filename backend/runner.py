@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import random
 import re
 import time
@@ -366,67 +367,159 @@ class Engine:
         self.emit("item_finished", {"run_id": self.run_id}, persist=False)
 
     async def _execute_step(self, page, step, data, timeout, respect_robots, evidence):
-        kind = step.get("type")
-        if kind not in STEP_TYPES:
-            raise StepError(f"Unsupported step type '{kind}'.", "config_error")
+        return await execute_step(page, step, data, timeout, respect_robots, evidence)
 
-        selector = render(step.get("selector", ""), data)
-        value = render(step.get("value", ""), data)
 
-        try:
-            if kind == "goto":
-                url = render(step["url"], data)
-                check_host_allowed(url)
-                if respect_robots and not robots_allows(url):
-                    raise StepError(
-                        f"robots.txt disallows automated access to {url}", "blocked"
-                    )
-                await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+async def read_text(locator):
+    """What a human would call the element's content.
 
-            elif kind == "wait_for":
-                await page.wait_for_selector(selector, timeout=timeout)
+    inner_text is always empty for form fields, so reading one would silently
+    yield nothing; their content is the value.
+    """
+    tag = (await locator.evaluate("el => el.tagName.toLowerCase()")) or ""
+    if tag in ("input", "textarea", "select"):
+        return (await locator.input_value()).strip()
+    return (await locator.inner_text()).strip()
 
-            elif kind == "fill":
-                await page.fill(selector, value, timeout=timeout)
 
-            elif kind == "click":
-                await page.click(selector, timeout=timeout)
+async def execute_step(page, step, data, timeout, respect_robots, evidence):
+    kind = step.get("type")
+    if kind not in STEP_TYPES:
+        raise StepError(f"Unsupported step type '{kind}'.", "config_error")
 
-            elif kind == "assert_text":
-                locator = page.locator(selector).first
-                await locator.wait_for(timeout=timeout)
-                text = (await locator.inner_text()).strip()
-                expected = value.strip()
-                if expected and expected.lower() not in text.lower():
-                    raise StepError(
-                        f"Expected {expected!r} in {selector!r} but found {text[:120]!r}",
-                        "assertion_failed",
-                    )
-                evidence.setdefault("assertions", []).append(
-                    {"selector": selector, "text": text[:300]}
-                )
+    selector = render(step.get("selector", ""), data)
+    value = render(step.get("value", ""), data)
 
-            elif kind == "extract":
-                locator = page.locator(selector).first
-                await locator.wait_for(timeout=timeout)
-                evidence["extracted"][step.get("field", selector)] = (
-                    await locator.inner_text()
-                ).strip()[:500]
-
-            elif kind == "screenshot":
-                pass  # handled by the per-step capture in _process_record
-
-        except AuthorizationError:
-            raise
-        except StepError:
-            raise
-        except Exception as exc:
-            name = type(exc).__name__
-            if "Timeout" in name:
+    try:
+        if kind == "goto":
+            url = render(step["url"], data)
+            check_host_allowed(url)
+            if respect_robots and not robots_allows(url):
                 raise StepError(
-                    f"Timed out on {kind} ({selector or step.get('url', '')})", "timeout"
-                ) from exc
-            raise StepError(f"{kind} failed: {exc}", "step_error") from exc
+                    f"robots.txt disallows automated access to {url}", "blocked"
+                )
+            await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+
+        elif kind == "wait_for":
+            await page.wait_for_selector(selector, timeout=timeout)
+
+        elif kind == "fill":
+            await page.fill(selector, value, timeout=timeout)
+
+        elif kind == "click":
+            await page.click(selector, timeout=timeout)
+
+        elif kind == "assert_text":
+            locator = page.locator(selector).first
+            await locator.wait_for(timeout=timeout)
+            text = await read_text(locator)
+            expected = value.strip()
+            if expected and expected.lower() not in text.lower():
+                raise StepError(
+                    f"Expected {expected!r} in {selector!r} but found {text[:120]!r}",
+                    "assertion_failed",
+                )
+            evidence.setdefault("assertions", []).append(
+                {"selector": selector, "text": text[:300]}
+            )
+
+        elif kind == "extract":
+            locator = page.locator(selector).first
+            await locator.wait_for(timeout=timeout)
+            evidence["extracted"][step.get("field", selector)] = (
+                await read_text(locator)
+            )[:500]
+
+        elif kind == "screenshot":
+            pass  # handled by the per-step capture in _process_record
+
+    except AuthorizationError:
+        raise
+    except StepError:
+        raise
+    except Exception as exc:
+        name = type(exc).__name__
+        if "Timeout" in name:
+            raise StepError(
+                f"Timed out on {kind} ({selector or step.get('url', '')})", "timeout"
+            ) from exc
+        raise StepError(f"{kind} failed: {exc}", "step_error") from exc
+
+
+async def test_workflow(workflow, data):
+    """Run a workflow's steps once against one record, reporting each step.
+
+    Nothing is written to the database and no record changes status. The point is
+    to find out whether the selectors work before committing a whole queue to
+    them, which previously meant starting a real batch and hoping.
+    """
+    target = (workflow.get("target_domain") or "").lower()
+    if not any(target == d or target.endswith("." + d) for d in db.allowed_domains()):
+        raise AuthorizationError(
+            f"{target} is not in the allowed domains list. Add it in Settings only "
+            f"if you are authorized to automate that site."
+        )
+
+    settings = db.get_settings()
+    timeout = float(settings.get("step_timeout_seconds", 20)) * 1000
+    respect_robots = settings.get("respect_robots_txt", "1") == "1"
+    preferred = settings.get("browser_channel", "chrome") or None
+
+    evidence = {"steps": [], "extracted": {}}
+    results = []
+    browser = None
+
+    async with async_playwright() as pw:
+        try:
+            browser, channel = await launch_browser(pw, preferred, True)
+            context = await browser.new_context(viewport={"width": 1280, "height": 800})
+            page = await context.new_page()
+
+            for n, step in enumerate(workflow["steps"], start=1):
+                entry = {
+                    "n": n,
+                    "type": step.get("type"),
+                    "label": step.get("label") or step.get("type"),
+                    "target": step.get("url") or step.get("selector") or "",
+                }
+                try:
+                    await execute_step(page, step, data, timeout, respect_robots, evidence)
+                    entry["status"] = "ok"
+                except StepError as exc:
+                    entry["status"] = "failed"
+                    entry["issue"] = exc.issue
+                    entry["error"] = str(exc)
+                except Exception as exc:
+                    entry["status"] = "failed"
+                    entry["issue"] = "engine_error"
+                    entry["error"] = str(exc)
+
+                try:
+                    shot = await page.screenshot(type="jpeg", quality=55)
+                    entry["screenshot"] = (
+                        "data:image/jpeg;base64," + base64.b64encode(shot).decode()
+                    )
+                except Exception:
+                    pass
+
+                results.append(entry)
+                if entry["status"] == "failed":
+                    break  # later steps depend on this one having worked
+
+            await context.close()
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    return {
+        "ok": all(r["status"] == "ok" for r in results) and len(results) == len(workflow["steps"]),
+        "steps": results,
+        "extracted": evidence.get("extracted", {}),
+        "browser": channel,
+    }
 
 
 engine = Engine()

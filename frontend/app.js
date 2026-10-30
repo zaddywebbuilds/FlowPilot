@@ -372,8 +372,19 @@ RENDERERS.studio = async () => {
           <input type="text" id="wfAuth" value="${esc(editing.authorized_by)}" placeholder="Jane Doe, CTO at Example Ltd">
           <div class="hint">Required. Stored as your record of permission.</div></div>
 
-        <div class="field"><label>Add a step</label>
-          <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <div class="field">
+          <label>Build the steps</label>
+          <button class="btn primary" id="openPicker" style="width:100%;justify-content:center">
+            Open the page and click what to automate
+          </button>
+          <div class="hint">The easy way. Loads the site, you click a field or button,
+            and the step is written for you.</div>
+        </div>
+
+        <details style="margin-bottom:14px">
+          <summary class="muted" style="cursor:pointer;font-size:12.5px;padding:4px 0">
+            Or add a step by hand</summary>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
             <select id="stType" style="width:120px">
               ${STEP_TYPES.map((t) => `<option value="${t}">${t}</option>`).join('')}
             </select>
@@ -382,13 +393,17 @@ RENDERERS.studio = async () => {
             <button class="btn sm" id="addStep">Add</button>
           </div>
           <div class="hint">Use <span class="mono">{{column}}</span> to pull a value from each record.</div>
-        </div>
+        </details>
 
         <div class="field"><label>Steps</label>
           <textarea id="wfSteps" rows="10">${esc(JSON.stringify(editing.steps, null, 2))}</textarea></div>
 
-        <button class="btn primary" id="saveWf">${isEdit ? 'Save changes' : 'Create workflow'}</button>
-        ${isEdit ? '<button class="btn" id="cancelEdit" style="margin-left:8px">Cancel</button>' : ''}
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn primary" id="saveWf">${isEdit ? 'Save changes' : 'Create workflow'}</button>
+          ${isEdit ? '<button class="btn" id="testWf">Test on one record</button>' : ''}
+          ${isEdit ? '<button class="btn" id="cancelEdit">Cancel</button>' : ''}
+        </div>
+        <div id="testResults"></div>
       </div>
     </div>
   </div>`;
@@ -412,6 +427,19 @@ RENDERERS.studio = async () => {
       render();
     } catch (e) { toast(e.message, 'error'); }
   });
+
+  $('#openPicker').onclick = () => {
+    const domain = $('#wfDomain').value.trim().replace(/^https?:\/\//, '');
+    let seed = domain ? 'https://' + domain : '';
+    try {
+      const existing = JSON.parse($('#wfSteps').value).find((s) => s.type === 'goto');
+      // A templated URL cannot be loaded as-is, so fall back to the site root.
+      if (existing?.url && !existing.url.includes('{{')) seed = existing.url;
+    } catch {}
+    openPicker(seed);
+  };
+
+  if (isEdit) $('#testWf').onclick = () => runWorkflowTest(editing);
 
   $('#addStep').onclick = () => {
     const type = $('#stType').value;
@@ -463,6 +491,261 @@ RENDERERS.studio = async () => {
 
   if (isEdit) bindSchedule(editing);
 };
+
+async function runWorkflowTest(workflow) {
+  let steps;
+  try { steps = JSON.parse($('#wfSteps').value); }
+  catch { return toast('Fix the JSON before testing.', 'error'); }
+
+  const btn = $('#testWf');
+  const out = $('#testResults');
+  btn.disabled = true;
+  btn.textContent = 'Testing...';
+  out.innerHTML = `<div class="muted" style="margin-top:14px;font-size:13px">
+    Opening the page and walking through each step...</div>`;
+
+  try {
+    const r = await api(`/workflows/${workflow.id}/test`, {
+      method: 'POST',
+      body: JSON.stringify({ steps, target_domain: $('#wfDomain').value.trim() }),
+    });
+
+    const extracted = Object.entries(r.extracted || {});
+    out.innerHTML = `
+      <div class="notice ${r.ok ? '' : 'warn'}" style="margin-top:16px">
+        ${r.ok ? ICON.check : ICON.alert}
+        <div><strong>${r.ok ? 'All steps worked' : 'A step failed'}</strong>
+          Tested against: ${esc(Object.values(r.record || {}).join(', ') || 'no record data')}</div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <div class="table-wrap"><table>
+          <thead><tr><th>#</th><th>Step</th><th>Result</th><th>View</th></tr></thead>
+          <tbody>${r.steps.map((s) => `<tr>
+            <td class="muted">${s.n}</td>
+            <td><div class="truncate">${esc(s.label)}</div>
+              <div class="mono muted" style="font-size:11px"><div class="truncate">${esc(s.target)}</div></div></td>
+            <td>${s.status === 'ok'
+              ? '<span class="chip completed">ok</span>'
+              : `<span class="chip failed">${esc(s.issue || 'failed')}</span>
+                 <div class="muted" style="font-size:11px"><div class="truncate">${esc(s.error || '')}</div></div>`}</td>
+            <td>${s.screenshot
+              ? `<img class="thumb" src="${s.screenshot}" data-shot="${s.n}" style="cursor:zoom-in">`
+              : '<span class="muted">-</span>'}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+        ${extracted.length ? `<div class="card-body">
+          ${extracted.map(([k, v]) => `<div class="kv"><span>${esc(k)}</span>
+            <span class="truncate">${esc(v)}</span></div>`).join('')}
+        </div>` : ''}
+      </div>`;
+
+    out.querySelectorAll('[data-shot]').forEach((img) => {
+      img.onclick = () => window.open(img.src, '_blank');
+    });
+  } catch (e) {
+    out.innerHTML = `<div class="notice warn" style="margin-top:16px">${ICON.alert}
+      <div><strong>Could not test</strong>${esc(e.message)}</div></div>`;
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Test on one record';
+}
+
+// -- element picker ----------------------------------------------------------
+
+const pickerState = { shot: null, picked: null };
+
+function openPicker(defaultUrl) {
+  pickerState.picked = null;
+  pickerState.shot = null;
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  modal.id = 'pickerModal';
+  modal.innerHTML = `
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Pick from the page</h2>
+        <input type="text" id="pkUrl" value="${esc(defaultUrl || '')}"
+               placeholder="https://example.com/login" style="flex:1">
+        <button class="btn primary" id="pkLoad">Load</button>
+        <button class="btn" id="pkClose">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="picker-stage" id="pkStage">
+          <div class="placeholder">Enter the page address and press Load.<br>
+            Then click whatever you want the automation to use.</div>
+        </div>
+        <div class="picker-hint" id="pkHint"></div>
+      </div>
+      <div class="modal-foot" id="pkFoot">
+        <div class="muted" style="font-size:12.5px">Nothing selected yet.</div>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  $('#pkClose').onclick = closePicker;
+  $('#pkLoad').onclick = loadPickerPage;
+  $('#pkUrl').onkeydown = (e) => { if (e.key === 'Enter') loadPickerPage(); };
+  modal.onclick = (e) => { if (e.target === modal) closePicker(); };
+
+  if (defaultUrl) loadPickerPage();
+}
+
+async function closePicker() {
+  document.getElementById('pickerModal')?.remove();
+  try { await api('/picker/close', { method: 'POST' }); } catch {}
+}
+
+function setPickerBusy(busy, label) {
+  const btn = $('#pkLoad');
+  if (btn) { btn.disabled = busy; btn.textContent = busy ? (label || 'Loading...') : 'Load'; }
+}
+
+async function loadPickerPage() {
+  const url = $('#pkUrl').value.trim();
+  if (!url) return toast('Enter a page address first.', 'error');
+  setPickerBusy(true);
+
+  // Starting a browser and loading the page takes a good few seconds, and a
+  // silent wait reads as broken.
+  const started = Date.now();
+  $('#pkStage').innerHTML = `<div class="placeholder" id="pkWait">Starting a browser...</div>`;
+  const tick = setInterval(() => {
+    const waiting = $('#pkWait');
+    if (!waiting) return clearInterval(tick);
+    const seconds = Math.round((Date.now() - started) / 1000);
+    waiting.innerHTML = seconds < 6
+      ? 'Starting a browser...'
+      : `Loading ${esc(url)}<br><span style="font-size:11.5px">${seconds}s &middot; the first page is the slowest</span>`;
+  }, 1000);
+
+  try {
+    pickerState.shot = await api('/picker/open', {
+      method: 'POST', body: JSON.stringify({ url }),
+    });
+    clearInterval(tick);
+    // Sites redirect, so show where we actually landed rather than what was typed.
+    $('#pkUrl').value = pickerState.shot.url;
+    paintPicker();
+  } catch (e) {
+    clearInterval(tick);
+    toast(e.message, 'error');
+    $('#pkStage').innerHTML = `<div class="placeholder">${esc(e.message)}</div>`;
+  }
+  setPickerBusy(false);
+}
+
+function paintPicker() {
+  const shot = pickerState.shot;
+  const stage = $('#pkStage');
+  stage.innerHTML = `<img id="pkImg" src="${shot.image}" alt="Page preview">`;
+
+  const atTop = shot.scroll_y <= 0;
+  const atBottom = shot.scroll_y + shot.height >= shot.page_height - 4;
+  $('#pkHint').innerHTML = `
+    <button class="btn sm" id="pkUp" ${atTop ? 'disabled' : ''}>Scroll up</button>
+    <button class="btn sm" id="pkDown" ${atBottom ? 'disabled' : ''}>Scroll down</button>
+    <span class="truncate">${esc(shot.title || shot.url)}</span>`;
+
+  $('#pkUp').onclick = () => scrollPicker('up');
+  $('#pkDown').onclick = () => scrollPicker('down');
+
+  $('#pkImg').onclick = async (event) => {
+    const img = event.currentTarget;
+    const rect = img.getBoundingClientRect();
+    // The screenshot is displayed scaled, so map the click back to page pixels.
+    const scale = shot.width / rect.width;
+    const x = (event.clientX - rect.left) * scale;
+    const y = (event.clientY - rect.top) * scale;
+
+    try {
+      const found = await api('/picker/pick', {
+        method: 'POST', body: JSON.stringify({ x, y }),
+      });
+      pickerState.picked = found;
+      highlightPicked(found, rect.width / shot.width);
+      paintPicked(found);
+    } catch (e) { toast(e.message, 'error'); }
+  };
+}
+
+function highlightPicked(found, ratio) {
+  const stage = $('#pkStage');
+  stage.querySelector('.picker-highlight')?.remove();
+  const box = document.createElement('div');
+  box.className = 'picker-highlight';
+  box.style.left = `${found.box.x * ratio}px`;
+  box.style.top = `${found.box.y * ratio}px`;
+  box.style.width = `${found.box.width * ratio}px`;
+  box.style.height = `${found.box.height * ratio}px`;
+  stage.appendChild(box);
+}
+
+function paintPicked(found) {
+  const ambiguous = found.matches !== 1;
+  $('#pkFoot').innerHTML = `
+    <div class="picked">
+      <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:220px">
+          <div class="muted" style="font-size:11.5px;margin-bottom:3px">
+            &lt;${esc(found.tag)}&gt;${found.text ? ' &middot; ' + esc(found.text.slice(0, 60)) : ''}</div>
+          <div class="mono" style="font-size:12px">${esc(found.selector)}</div>
+          ${ambiguous ? `<div class="hint" style="color:var(--amber)">
+            Matches ${found.matches} elements on this page, so it may not be specific enough.</div>` : ''}
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <select id="pkType" style="width:118px">
+            ${STEP_TYPES.map((t) => `<option value="${t}"
+              ${t === found.suggestion ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+          <input type="text" id="pkValue" placeholder="value" style="width:120px"
+                 value="${found.suggestion === 'fill' ? '{{email}}' : ''}">
+          <button class="btn primary" id="pkAdd">Add step</button>
+        </div>
+      </div>
+    </div>`;
+
+  $('#pkAdd').onclick = () => {
+    const type = $('#pkType').value;
+    const value = $('#pkValue').value.trim();
+    const step = { type, selector: found.selector, label: labelFor(type, found) };
+    if (type === 'extract') step.field = value || 'value';
+    else if (value) step.value = value;
+
+    let steps;
+    try { steps = JSON.parse($('#wfSteps').value); }
+    catch { return toast('Fix the JSON in the editor before adding.', 'error'); }
+
+    // A workflow has to open the page before it can touch anything on it.
+    if (!steps.some((s) => s.type === 'goto')) {
+      steps.unshift({ type: 'goto', url: pickerState.shot.url, label: 'Open the page' });
+    }
+    steps.push(step);
+    $('#wfSteps').value = JSON.stringify(steps, null, 2);
+    toast(`Added: ${step.label}`, 'success');
+  };
+}
+
+function labelFor(type, found) {
+  const what = found.text ? found.text.slice(0, 28)
+    : found.placeholder ? found.placeholder.slice(0, 28)
+    : found.tag;
+  return ({
+    fill: `Fill ${what}`, click: `Click ${what}`,
+    assert_text: `Check ${what}`, extract: `Read ${what}`,
+    wait_for: `Wait for ${what}`, goto: `Open ${what}`,
+  }[type] || `${type} ${what}`).slice(0, 44);
+}
+
+async function scrollPicker(direction) {
+  try {
+    pickerState.shot = await api('/picker/scroll', {
+      method: 'POST', body: JSON.stringify({ direction }),
+    });
+    paintPicker();
+  } catch (e) { toast(e.message, 'error'); }
+}
 
 function scheduleCardHTML(wf) {
   const on = Boolean(wf.schedule_enabled);

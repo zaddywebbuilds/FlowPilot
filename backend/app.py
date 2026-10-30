@@ -15,7 +15,9 @@ import auth
 import db
 import notify
 import sheets
+from picker import PickerError, picker
 from runner import AuthorizationError, engine
+from runner import test_workflow as run_test
 from scheduler import compute_next_run, scheduler
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +73,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     yield
     await scheduler.stop()
+    await picker.close()
 
 
 app = FastAPI(title="FlowPilot", lifespan=lifespan)
@@ -329,6 +332,110 @@ def set_schedule(workflow_id: int, payload: SchedulePayload):
 @app.get("/api/schedule")
 def schedule_status():
     return scheduler.status()
+
+
+# -- element picker ----------------------------------------------------------
+
+class PickerOpen(BaseModel):
+    url: str
+
+
+class PickerPoint(BaseModel):
+    x: float
+    y: float
+
+
+class PickerScroll(BaseModel):
+    direction: str = "down"
+
+
+def _picker_guard():
+    if engine.status != "idle":
+        raise HTTPException(409, "A run is in progress. Stop it before picking elements.")
+
+
+@app.post("/api/picker/open")
+async def picker_open(payload: PickerOpen):
+    _picker_guard()
+    url = payload.url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        return await picker.open(url)
+    except AuthorizationError as exc:
+        raise HTTPException(403, str(exc))
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"Could not open that page: {exc}")
+
+
+@app.post("/api/picker/scroll")
+async def picker_scroll(payload: PickerScroll):
+    try:
+        return await picker.scroll(payload.direction)
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/picker/pick")
+async def picker_pick(payload: PickerPoint):
+    try:
+        return await picker.pick(payload.x, payload.y)
+    except PickerError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/picker/close")
+async def picker_close():
+    await picker.close()
+    return {"ok": True}
+
+
+# -- test a workflow against one record --------------------------------------
+
+class TestPayload(BaseModel):
+    steps: list[dict] | None = None
+    target_domain: str | None = None
+    record_id: int | None = None
+    data: dict | None = None
+
+
+@app.post("/api/workflows/{workflow_id}/test")
+async def test_workflow_endpoint(workflow_id: int, payload: TestPayload):
+    _picker_guard()
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(404, "Workflow not found.")
+
+    # Unsaved edits can be tested, so the editor does not force a save first.
+    # None means "not sent"; an empty list means the editor really is empty, and
+    # silently testing the saved steps instead would be a lie.
+    if payload.steps is not None:
+        workflow = {**workflow, "steps": payload.steps}
+    if payload.target_domain:
+        workflow = {**workflow, "target_domain": payload.target_domain.lower()}
+    if not workflow["steps"]:
+        raise HTTPException(400, "This workflow has no steps.")
+
+    data = payload.data
+    if data is None:
+        if payload.record_id:
+            row = db.query_one("SELECT data_json FROM records WHERE id = ?", (payload.record_id,))
+            data = json.loads(row["data_json"]) if row else None
+        else:
+            pending = db.list_records(workflow_id, status="pending", limit=1)
+            any_record = pending or db.list_records(workflow_id, limit=1)
+            data = any_record[0]["data"] if any_record else {}
+
+    try:
+        result = await run_test(workflow, data or {})
+    except AuthorizationError as exc:
+        raise HTTPException(403, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Test could not run: {exc}")
+
+    return {**result, "record": data}
 
 
 # -- records / queue ---------------------------------------------------------
