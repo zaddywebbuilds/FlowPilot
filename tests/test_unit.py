@@ -297,9 +297,40 @@ def test_prune_removes_old_runs_only(fresh_db):
         (folder / "item_1_step_1.jpg").write_bytes(b"x")
 
     fresh_db.set_setting("evidence_retention_days", "14")
-    assert fresh_db.prune_evidence() == 1
+    pruned = fresh_db.prune_old_data()
+    assert pruned["runs"] == 1
     assert not (fresh_db.EVIDENCE_DIR / f"run_{old_run}").exists()
     assert (fresh_db.EVIDENCE_DIR / f"run_{new_run}").exists()
+
+
+def test_prune_also_removes_database_rows(fresh_db):
+    """Pruning screenshots but not their rows would leave the database growing."""
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    fresh_db.add_records(wf, [{"email": "a@test"}, {"email": "b@test"}])
+    records = fresh_db.list_records(wf)
+
+    run_id = fresh_db.create_run(wf, 2, 2)
+    for record in records:
+        item = fresh_db.create_run_item(run_id, record["id"])
+        fresh_db.finish_run_item(item, "completed", started_at=time.time())
+    fresh_db.log_event(run_id, "something happened")
+    fresh_db.update_run(run_id, status="completed",
+                        finished_at=time.time() - 40 * 86400)
+
+    assert fresh_db.row_counts()["run_items"] == 2
+    assert fresh_db.row_counts()["events"] >= 1
+
+    fresh_db.set_setting("evidence_retention_days", "14")
+    pruned = fresh_db.prune_old_data()
+
+    assert pruned["items"] == 2
+    assert pruned["events"] >= 1
+    assert fresh_db.row_counts()["run_items"] == 0
+    assert fresh_db.row_counts()["events"] == 0
+
+    # The run summary is small and is kept, so history and analytics survive.
+    assert fresh_db.get_run(run_id) is not None
+    assert fresh_db.row_counts()["runs"] == 1
 
 
 def test_retention_of_zero_keeps_everything(fresh_db):
@@ -312,8 +343,69 @@ def test_retention_of_zero_keeps_everything(fresh_db):
     (folder / "a.jpg").write_bytes(b"x")
 
     fresh_db.set_setting("evidence_retention_days", "0")
-    assert fresh_db.prune_evidence() == 0
+    assert fresh_db.prune_old_data()["runs"] == 0
     assert folder.exists()
+
+
+# -- workflow scoping --------------------------------------------------------
+
+def test_runs_and_analytics_are_scoped_to_a_workflow(fresh_db):
+    a = fresh_db.create_workflow("a", "", "example.com", [], "tester")
+    b = fresh_db.create_workflow("b", "", "example.com", [], "tester")
+
+    run_a = fresh_db.create_run(a, 1, 1)
+    fresh_db.update_run(run_a, status="completed", completed=5, finished_at=time.time())
+    run_b = fresh_db.create_run(b, 1, 1)
+    fresh_db.update_run(run_b, status="completed", completed=2, finished_at=time.time())
+
+    assert len(fresh_db.list_runs()) == 2
+    assert [r["id"] for r in fresh_db.list_runs(workflow_id=a)] == [run_a]
+
+    assert fresh_db.analytics_summary()["completed"] == 7
+    assert fresh_db.analytics_summary(a)["completed"] == 5
+    assert fresh_db.analytics_summary(b)["completed"] == 2
+
+
+def test_review_items_are_scoped_to_a_workflow(fresh_db):
+    a = fresh_db.create_workflow("a", "", "example.com", [], "tester")
+    b = fresh_db.create_workflow("b", "", "example.com", [], "tester")
+    fresh_db.add_records(a, [{"email": "a@test"}])
+    fresh_db.add_records(b, [{"email": "b@test"}])
+
+    for wf in (a, b):
+        record = fresh_db.list_records(wf)[0]
+        run_id = fresh_db.create_run(wf, 1, 1)
+        item = fresh_db.create_run_item(run_id, record["id"])
+        fresh_db.finish_run_item(item, "review", issue="assertion_failed",
+                                 started_at=time.time())
+
+    assert len(fresh_db.list_review_items()) == 2
+    scoped = fresh_db.list_review_items(workflow_id=a)
+    assert len(scoped) == 1
+    assert scoped[0]["data"]["email"] == "a@test"
+
+
+def test_matching_record_count_respects_the_filter(fresh_db):
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    fresh_db.add_records(wf, [{"email": f"user{i}@test"} for i in range(25)])
+
+    assert fresh_db.count_matching_records(wf) == 25
+    assert fresh_db.count_matching_records(wf, status="pending") == 25
+    assert fresh_db.count_matching_records(wf, status="completed") == 0
+    assert fresh_db.count_matching_records(wf, search="user7@") == 1
+
+
+def test_record_paging_walks_the_whole_queue(fresh_db):
+    wf = fresh_db.create_workflow("w", "", "example.com", [], "tester")
+    fresh_db.add_records(wf, [{"email": f"user{i:03}@test"} for i in range(250)])
+
+    seen = []
+    for offset in range(0, 250, 100):
+        page = fresh_db.list_records(wf, limit=100, offset=offset)
+        seen.extend(r["data"]["email"] for r in page)
+
+    assert len(seen) == 250
+    assert len(set(seen)) == 250, "pages must not overlap"
 
 
 # -- migrations --------------------------------------------------------------

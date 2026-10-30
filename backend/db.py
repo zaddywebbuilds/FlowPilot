@@ -215,6 +215,15 @@ def execute(sql, params=()):
         return cur.lastrowid
 
 
+def execute_count(sql, params=()):
+    """Like execute, but returns how many rows were affected."""
+    with _lock:
+        c = conn()
+        cur = c.execute(sql, params)
+        c.commit()
+        return cur.rowcount
+
+
 def execute_many(sql, seq):
     with _lock:
         c = conn()
@@ -330,39 +339,72 @@ def scheduled_workflows():
 
 # evidence ------------------------------------------------------------------
 
-def prune_evidence():
-    """Delete screenshot folders for runs older than the retention window.
+def prune_old_data():
+    """Drop per-record detail for runs past the retention window.
 
-    Every step of every record writes a JPEG, so without this the disk fills up
-    on a long-running server.
+    Each record writes a screenshot per step plus a run_items row, and each run
+    writes event rows, so at any real volume both the disk and the database grow
+    without bound. The run summary row is small and is kept, so Run History and
+    Analytics stay intact; only the bulky per-record detail goes.
     """
     try:
         days = int(get_setting("evidence_retention_days", "14"))
     except ValueError:
         days = 14
     if days <= 0:
-        return 0
+        return {"runs": 0, "files": 0, "items": 0, "events": 0}
 
     cutoff = time.time() - days * 86400
     old = query(
         "SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at < ?",
         (cutoff,),
     )
-    removed = 0
-    for row in old:
-        folder = EVIDENCE_DIR / f"run_{row['id']}"
-        if folder.is_dir():
-            for child in folder.iterdir():
-                try:
-                    child.unlink()
-                except OSError:
-                    pass
+    if not old:
+        return {"runs": 0, "files": 0, "items": 0, "events": 0}
+
+    ids = [row["id"] for row in old]
+    files = 0
+    folders = 0
+
+    for run_id in ids:
+        folder = EVIDENCE_DIR / f"run_{run_id}"
+        if not folder.is_dir():
+            continue
+        for child in folder.iterdir():
             try:
-                folder.rmdir()
-                removed += 1
+                child.unlink()
+                files += 1
             except OSError:
                 pass
-    return removed
+        try:
+            folder.rmdir()
+            folders += 1
+        except OSError:
+            pass
+
+    placeholders = ",".join("?" * len(ids))
+    items = execute_count(
+        f"DELETE FROM run_items WHERE run_id IN ({placeholders})", tuple(ids)
+    )
+    events = execute_count(
+        f"DELETE FROM events WHERE run_id IN ({placeholders})", tuple(ids)
+    )
+
+    return {"runs": folders, "files": files, "items": items, "events": events}
+
+
+def database_size():
+    try:
+        return DB_PATH.stat().st_size
+    except OSError:
+        return 0
+
+
+def row_counts():
+    return {
+        table: query_one(f"SELECT COUNT(*) AS n FROM {table}")["n"]
+        for table in ("records", "runs", "run_items", "events")
+    }
 
 
 def evidence_usage():
@@ -416,6 +458,20 @@ def list_records(workflow_id, status=None, search=None, limit=100, offset=0):
     return rows
 
 
+def count_matching_records(workflow_id, status=None, search=None):
+    """How many records the current filter matches, for pagination."""
+    sql = "SELECT COUNT(*) AS n FROM records WHERE workflow_id = ?"
+    params = [workflow_id]
+    if status and status != "all":
+        sql += " AND status = ?"
+        params.append(status)
+    if search:
+        sql += " AND data_json LIKE ?"
+        params.append(f"%{search}%")
+    row = query_one(sql, tuple(params))
+    return row["n"] if row else 0
+
+
 def count_records(workflow_id):
     rows = query(
         "SELECT status, COUNT(*) AS n FROM records WHERE workflow_id = ? GROUP BY status",
@@ -451,7 +507,12 @@ def get_run(run_id):
     return query_one("SELECT * FROM runs WHERE id = ?", (run_id,))
 
 
-def list_runs(limit=50):
+def list_runs(limit=50, workflow_id=None):
+    if workflow_id:
+        return query(
+            "SELECT * FROM runs WHERE workflow_id = ? ORDER BY id DESC LIMIT ?",
+            (workflow_id, limit),
+        )
     return query("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
 
 
@@ -497,12 +558,15 @@ def list_run_items(run_id):
     return rows
 
 
-def list_review_items(issue=None, limit=200):
+def list_review_items(issue=None, limit=200, workflow_id=None):
     sql = (
         "SELECT ri.*, r.data_json FROM run_items ri "
         "JOIN records r ON r.id = ri.record_id WHERE ri.status = 'review'"
     )
     params = []
+    if workflow_id:
+        sql += " AND r.workflow_id = ?"
+        params.append(workflow_id)
     if issue and issue != "all":
         sql += " AND ri.issue = ?"
         params.append(issue)
@@ -527,27 +591,43 @@ def resolve_run_item(item_id, resolution):
 
 # analytics ------------------------------------------------------------------
 
-def analytics_summary():
+def analytics_summary(workflow_id=None):
+    scope = " WHERE workflow_id = ?" if workflow_id else ""
+    args = (workflow_id,) if workflow_id else ()
+
     totals = query_one(
         "SELECT COUNT(*) AS runs, COALESCE(SUM(completed),0) AS completed, "
-        "COALESCE(SUM(failed),0) AS failed, COALESCE(SUM(review),0) AS review FROM runs"
+        "COALESCE(SUM(failed),0) AS failed, COALESCE(SUM(review),0) AS review "
+        f"FROM runs{scope}",
+        args,
     ) or {"runs": 0, "completed": 0, "failed": 0, "review": 0}
 
+    item_scope = (
+        " AND ri.run_id IN (SELECT id FROM runs WHERE workflow_id = ?)"
+        if workflow_id else ""
+    )
+
     avg = query_one(
-        "SELECT AVG(duration_ms) AS avg_ms FROM run_items WHERE duration_ms IS NOT NULL"
+        "SELECT AVG(ri.duration_ms) AS avg_ms FROM run_items ri "
+        f"WHERE ri.duration_ms IS NOT NULL{item_scope}",
+        args,
     )
     totals["avg_ms"] = int(avg["avg_ms"]) if avg and avg["avg_ms"] else 0
 
     daily = query(
         "SELECT CAST(strftime('%s', date(started_at, 'unixepoch')) AS INTEGER) AS day, "
         "COALESCE(SUM(completed),0) AS completed, COALESCE(SUM(failed),0) AS failed, "
-        "COALESCE(SUM(review),0) AS review "
-        "FROM runs WHERE started_at IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 7"
+        "COALESCE(SUM(review),0) AS review FROM runs "
+        f"WHERE started_at IS NOT NULL{' AND workflow_id = ?' if workflow_id else ''} "
+        "GROUP BY day ORDER BY day DESC LIMIT 7",
+        args,
     )
     totals["daily"] = list(reversed(daily))
 
     totals["issues"] = query(
-        "SELECT COALESCE(issue, 'unknown') AS issue, COUNT(*) AS n FROM run_items "
-        "WHERE status IN ('failed','review') GROUP BY issue ORDER BY n DESC"
+        "SELECT COALESCE(ri.issue, 'unknown') AS issue, COUNT(*) AS n FROM run_items ri "
+        f"WHERE ri.status IN ('failed','review'){item_scope} "
+        "GROUP BY ri.issue ORDER BY n DESC",
+        args,
     )
     return totals

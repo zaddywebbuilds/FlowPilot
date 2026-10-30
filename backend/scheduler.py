@@ -103,9 +103,14 @@ class Scheduler:
 
                 if time.time() - self.last_housekeeping > HOUSEKEEPING_SECONDS:
                     self.last_housekeeping = time.time()
-                    removed = db.prune_evidence()
-                    if removed:
-                        db.log_event(None, f"Pruned evidence for {removed} old run(s).")
+                    pruned = db.prune_old_data()
+                    if pruned["runs"] or pruned["items"]:
+                        db.log_event(
+                            None,
+                            f"Housekeeping: removed {pruned['files']} screenshot(s), "
+                            f"{pruned['items']} record result(s) and {pruned['events']} "
+                            f"log entries from {pruned['runs']} old run(s).",
+                        )
 
                 if db.get_setting("scheduler_enabled", "1") != "1":
                     continue

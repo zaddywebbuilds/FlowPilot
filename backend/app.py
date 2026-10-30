@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     recovered = db.recover_interrupted_runs()
     if recovered:
         print(f"[flowpilot] recovered {recovered} interrupted run(s) from a previous stop")
-    db.prune_evidence()
+    db.prune_old_data()
     scheduler.start()
     yield
     await scheduler.stop()
@@ -342,9 +342,14 @@ def get_records(
     offset: int = 0,
 ):
     wid = active_workflow_id(workflow_id)
+    counts = db.count_records(wid)
+    matching = db.count_matching_records(wid, status, search)
     return {
         "records": db.list_records(wid, status, search, limit, offset),
-        "counts": db.count_records(wid),
+        "counts": counts,
+        "matching": matching,
+        "offset": offset,
+        "limit": limit,
     }
 
 
@@ -432,8 +437,8 @@ def stop_run():
 # -- run history -------------------------------------------------------------
 
 @app.get("/api/runs")
-def get_runs(limit: int = 50):
-    runs = db.list_runs(limit)
+def get_runs(limit: int = 50, workflow_id: int | None = None):
+    runs = db.list_runs(limit, workflow_id)
     for r in runs:
         if r["finished_at"] and r["started_at"]:
             r["duration_s"] = int(r["finished_at"] - r["started_at"])
@@ -471,12 +476,17 @@ def export_run(run_id: int):
 # -- review center -----------------------------------------------------------
 
 @app.get("/api/review")
-def get_review(issue: str = "all"):
-    items = db.list_review_items(issue)
-    counts = db.query(
-        "SELECT COALESCE(issue,'unknown') AS issue, COUNT(*) AS n FROM run_items "
-        "WHERE status = 'review' GROUP BY issue"
+def get_review(issue: str = "all", workflow_id: int | None = None):
+    items = db.list_review_items(issue, workflow_id=workflow_id)
+    sql = (
+        "SELECT COALESCE(ri.issue,'unknown') AS issue, COUNT(*) AS n FROM run_items ri "
+        "JOIN records r ON r.id = ri.record_id WHERE ri.status = 'review'"
     )
+    params = []
+    if workflow_id:
+        sql += " AND r.workflow_id = ?"
+        params.append(workflow_id)
+    counts = db.query(sql + " GROUP BY ri.issue", tuple(params))
     return {"items": items, "counts": {c["issue"]: c["n"] for c in counts}}
 
 
@@ -493,8 +503,8 @@ def resolve(item_id: int, payload: ResolvePayload):
 # -- analytics ---------------------------------------------------------------
 
 @app.get("/api/analytics")
-def analytics():
-    return db.analytics_summary()
+def analytics(workflow_id: int | None = None):
+    return db.analytics_summary(workflow_id)
 
 
 # -- integrations ------------------------------------------------------------
@@ -522,12 +532,15 @@ def evidence_status():
         **usage,
         "megabytes": round(usage["bytes"] / 1048576, 1),
         "retention_days": db.get_setting("evidence_retention_days", "14"),
+        "database_mb": round(db.database_size() / 1048576, 1),
+        "rows": db.row_counts(),
     }
 
 
 @app.post("/api/evidence/prune")
 def evidence_prune():
-    return {"removed_runs": db.prune_evidence(), **db.evidence_usage()}
+    pruned = db.prune_old_data()
+    return {"pruned": pruned, **db.evidence_usage(), "rows": db.row_counts()}
 
 
 @app.get("/api/integrations")

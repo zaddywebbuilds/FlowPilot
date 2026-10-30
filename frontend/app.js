@@ -34,7 +34,7 @@ const state = {
   engine: { status: 'idle', current: {} },
   logs: [],
   badges: {},
-  queueFilter: { status: 'all', search: '' },
+  queueFilter: { status: 'all', search: '', offset: 0, limit: 100 },
   reviewFilter: 'all',
   openRun: null,
   workflowId: Number(localStorage.getItem('fp-workflow')) || null,
@@ -50,7 +50,10 @@ function wfQuery(prefix = '?') {
 function setWorkflow(id) {
   state.workflowId = id ? Number(id) : null;
   try { localStorage.setItem('fp-workflow', state.workflowId || ''); } catch {}
+  // Anything scoped to the old workflow is meaningless now.
   state.openRun = null;
+  state.queueFilter.offset = 0;
+  state.reviewFilter = 'all';
   render();
 }
 
@@ -535,11 +538,14 @@ function bindSchedule(wf) {
 // -- Record Queue ------------------------------------------------------------
 
 RENDERERS.queue = async () => {
-  const { status, search } = state.queueFilter;
+  const { status, search, offset, limit } = state.queueFilter;
   const d = await api(
-    `/records?status=${status}&search=${encodeURIComponent(search)}&limit=200${wfQuery('&')}`
+    `/records?status=${status}&search=${encodeURIComponent(search)}` +
+    `&limit=${limit}&offset=${offset}${wfQuery('&')}`
   );
   const c = d.counts;
+  const from = d.matching ? offset + 1 : 0;
+  const to = offset + d.records.length;
 
   view.innerHTML = pageHead(
     'Record Queue',
@@ -579,7 +585,10 @@ RENDERERS.queue = async () => {
           .map((s) => `<option value="${s}" ${s === status ? 'selected' : ''}>${s[0].toUpperCase() + s.slice(1)}</option>`).join('')}
       </select>
       <div class="spacer"></div>
-      <span class="muted">${d.records.length} shown</span>
+      <span class="muted">${from.toLocaleString()}-${to.toLocaleString()}
+        of ${d.matching.toLocaleString()}</span>
+      <button class="btn sm" id="qPrev" ${offset === 0 ? 'disabled' : ''}>Previous</button>
+      <button class="btn sm" id="qNext" ${to >= d.matching ? 'disabled' : ''}>Next</button>
     </div>
     <div class="table-wrap">
       ${d.records.length ? `<table>
@@ -632,11 +641,28 @@ RENDERERS.queue = async () => {
       btn.disabled = false; btn.textContent = 'Import from Sheet';
     }
   };
-  $('#qStatus').onchange = (e) => { state.queueFilter.status = e.target.value; render(); };
+  $('#qPrev').onclick = () => {
+    state.queueFilter.offset = Math.max(0, offset - limit);
+    render();
+  };
+  $('#qNext').onclick = () => {
+    state.queueFilter.offset = offset + limit;
+    render();
+  };
+  // Changing what is being filtered invalidates the current page.
+  $('#qStatus').onchange = (e) => {
+    state.queueFilter.status = e.target.value;
+    state.queueFilter.offset = 0;
+    render();
+  };
   let t;
   $('#qSearch').oninput = (e) => {
     clearTimeout(t);
-    t = setTimeout(() => { state.queueFilter.search = e.target.value; render(); }, 280);
+    t = setTimeout(() => {
+      state.queueFilter.search = e.target.value;
+      state.queueFilter.offset = 0;
+      render();
+    }, 280);
   };
   view.querySelectorAll('[data-reset]').forEach((b) => b.onclick = async () => {
     await api(`/records/${b.dataset.reset}/reset`, { method: 'POST' });
@@ -763,12 +789,18 @@ function paintLive() {
 
 RENDERERS.history = async () => {
   if (state.openRun) return renderRunDetail(state.openRun);
-  const runs = await api('/runs');
+  const [runs, workflows] = await Promise.all([
+    api(`/runs${wfQuery()}`), api('/workflows'),
+  ]);
+  state.workflows = workflows;
   const ok = runs.filter((r) => r.status === 'completed').length;
   const partial = runs.filter((r) => r.failed || r.review).length;
-  const bad = runs.filter((r) => r.status === 'failed').length;
+  const bad = runs.filter((r) => ['failed', 'interrupted'].includes(r.status)).length;
 
-  view.innerHTML = pageHead('Run History', 'Every batch, its outcome and exportable results.') + `
+  view.innerHTML = pageHead(
+    'Run History', 'Every batch, its outcome and exportable results.',
+    workflowSelect('hWfSelect')
+  ) + `
   <div class="grid cols-4" style="margin-bottom:16px">
     ${statTile('history', '', runs.length, 'Total runs')}
     ${statTile('check', 'green', ok, 'Successful')}
@@ -777,11 +809,13 @@ RENDERERS.history = async () => {
   </div>
   <div class="card"><div class="table-wrap">
     ${runs.length ? `<table>
-      <thead><tr><th>#</th><th>Started</th><th>Batch</th><th>Completed</th><th>Review</th>
+      <thead><tr><th>#</th><th>Started</th><th>Trigger</th><th>Batch</th><th>Completed</th><th>Review</th>
         <th>Failed</th><th>Duration</th><th>Status</th><th></th></tr></thead>
       <tbody>${runs.map((r) => `<tr>
         <td class="muted">${r.id}</td>
         <td>${fmtTime(r.started_at)}</td>
+        <td><span class="chip ${r.trigger === 'schedule' ? 'running' : ''}">
+          ${r.trigger === 'schedule' ? 'scheduled' : 'manual'}</span></td>
         <td>${r.total}</td>
         <td><strong>${r.completed}</strong></td>
         <td>${r.review || 0}</td>
@@ -796,6 +830,7 @@ RENDERERS.history = async () => {
       : emptyState('No runs yet', 'Completed runs will be listed here.')}
   </div></div>`;
 
+  bindWorkflowSelect('hWfSelect');
   view.querySelectorAll('[data-run]').forEach((b) =>
     b.onclick = () => { state.openRun = b.dataset.run; render(); });
 };
@@ -838,7 +873,10 @@ async function renderRunDetail(runId) {
 // -- Review Center -----------------------------------------------------------
 
 RENDERERS.review = async () => {
-  const d = await api(`/review?issue=${state.reviewFilter}`);
+  const [d, workflows] = await Promise.all([
+    api(`/review?issue=${state.reviewFilter}${wfQuery('&')}`), api('/workflows'),
+  ]);
+  state.workflows = workflows;
   state.badges.review = d.items.length;
   renderNav();
 
@@ -846,7 +884,8 @@ RENDERERS.review = async () => {
 
   view.innerHTML = pageHead(
     'Review Center',
-    'Records the engine could not confirm. Approve or reject each one by hand.'
+    'Records the engine could not confirm. Approve or reject each one by hand.',
+    workflowSelect('rWfSelect')
   ) + `
   <div class="notice warn" style="margin-bottom:16px">${ICON.alert}
     <div><strong>Nothing here is retried automatically</strong>
@@ -876,6 +915,7 @@ RENDERERS.review = async () => {
     </div>
   </div>`;
 
+  bindWorkflowSelect('rWfSelect');
   view.querySelectorAll('[data-issue]').forEach((b) =>
     b.onclick = () => { state.reviewFilter = b.dataset.issue; render(); });
   view.querySelectorAll('[data-approve]').forEach((b) => b.onclick = () => resolve(b.dataset.approve, 'approve'));
@@ -893,12 +933,18 @@ async function resolve(id, resolution) {
 // -- Analytics ---------------------------------------------------------------
 
 RENDERERS.analytics = async () => {
-  const a = await api('/analytics');
+  const [a, workflows] = await Promise.all([
+    api(`/analytics${wfQuery()}`), api('/workflows'),
+  ]);
+  state.workflows = workflows;
   const processed = a.completed + a.failed + a.review;
   const rate = processed ? Math.round(a.completed / processed * 100) : 0;
   const max = Math.max(1, ...a.daily.map((d) => d.completed + d.failed + d.review));
 
-  view.innerHTML = pageHead('Analytics', 'Outcomes, error categories and processing time.') + `
+  view.innerHTML = pageHead(
+    'Analytics', 'Outcomes, error categories and processing time.',
+    workflowSelect('aWfSelect')
+  ) + `
   <div class="grid cols-4" style="margin-bottom:16px">
     ${statTile('check', 'green', a.completed, 'Completed all time')}
     ${statTile('alert', 'amber', a.review, 'Sent to review')}
@@ -966,6 +1012,8 @@ RENDERERS.analytics = async () => {
       <div class="kv"><span>Total runs</span><span>${a.runs}</span></div>
     </div>
   </div>`;
+
+  bindWorkflowSelect('aWfSelect');
 };
 
 function donut(slices, total) {
@@ -1046,11 +1094,13 @@ RENDERERS.integrations = async () => {
       <div class="card-head"><div><h2>Evidence storage</h2>
         <p>Screenshots kept as proof of each step.</p></div></div>
       <div class="card-body">
-        <div class="kv"><span>Files</span><span>${ev.files.toLocaleString()}</span></div>
-        <div class="kv"><span>Disk used</span><span>${ev.megabytes} MB</span></div>
+        <div class="kv"><span>Screenshots</span><span>${ev.files.toLocaleString()} (${ev.megabytes} MB)</span></div>
+        <div class="kv"><span>Database</span><span>${ev.database_mb} MB</span></div>
+        <div class="kv"><span>Record results</span><span>${ev.rows.run_items.toLocaleString()} rows</span></div>
+        <div class="kv"><span>Log entries</span><span>${ev.rows.events.toLocaleString()} rows</span></div>
         <div class="kv"><span>Retention</span><span>${ev.retention_days === '0'
           ? 'forever' : `${esc(ev.retention_days)} days`}</span></div>
-        <button class="btn" id="pruneNow" style="margin-top:12px">Prune old evidence now</button>
+        <button class="btn" id="pruneNow" style="margin-top:12px">Prune old data now</button>
       </div>
     </div>
   </div>
@@ -1069,8 +1119,13 @@ RENDERERS.integrations = async () => {
 
   $('#pruneNow').onclick = async () => {
     try {
-      const r = await api('/evidence/prune', { method: 'POST' });
-      toast(`Pruned ${r.removed_runs} run folder(s). ${r.files} file(s) left.`, 'success');
+      const { pruned } = await api('/evidence/prune', { method: 'POST' });
+      toast(
+        pruned.runs
+          ? `Removed ${pruned.files} screenshot(s), ${pruned.items} result(s) and ${pruned.events} log entries from ${pruned.runs} old run(s).`
+          : 'Nothing is past the retention window yet.',
+        'success'
+      );
       render();
     } catch (e) { toast(e.message, 'error'); }
   };
