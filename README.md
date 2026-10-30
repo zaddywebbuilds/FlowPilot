@@ -70,15 +70,31 @@ service account, runs the app under systemd with headless mode on, and puts Cadd
 front so HTTPS works with a real certificate. Point the domain's DNS at the server
 first, otherwise the certificate request fails.
 
-**No domain?** Drop `DOMAIN=` and run `bash install.sh`. FlowPilot then listens only on
-127.0.0.1, so it is not reachable from the internet at all, and you reach it through an
-SSH tunnel:
+### No domain? Get one free
+
+You cannot get an HTTPS certificate for a bare IP address, so `https://1.2.3.4` is not
+an option no matter what. A free subdomain fixes that in about two minutes:
+
+1. Sign in at [duckdns.org](https://www.duckdns.org) with GitHub
+2. Create a subdomain, for example `flowpilot-acme`
+3. Put your server's IP in the box and press update
+
+Then deploy with `DOMAIN=flowpilot-acme.duckdns.org bash install.sh` and share the
+https link. [sslip.io](https://sslip.io) needs no signup at all, since
+`1.2.3.4.sslip.io` already resolves to `1.2.3.4`, though it is shared with many people
+and occasionally hits certificate rate limits.
+
+### Or keep it private
+
+Drop `DOMAIN=` and run `bash install.sh`. FlowPilot then listens only on 127.0.0.1, so
+it is not reachable from the internet at all, and you reach it through an SSH tunnel:
 
 ```bash
 ssh -L 8000:127.0.0.1:8000 root@your-server-ip
 ```
 
-Then open http://127.0.0.1:8000 on your own machine.
+Then open http://127.0.0.1:8000 on your own machine. This is the right choice when the
+dashboard is only for you, and the wrong one when you need to send someone a link.
 
 Either way port 8000 is never exposed directly. The dashboard requires a password
 before anything is reachable, and the session cookie sets its Secure flag automatically

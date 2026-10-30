@@ -139,8 +139,12 @@ else
     echo
     info "then open  http://127.0.0.1:$PORT  in your browser."
     echo
-    info "To share it with someone else instead, point a domain at this server"
-    info "and re-run:  DOMAIN=your.domain bash install.sh"
+    info "To send someone a link instead, you need a domain name, because no"
+    info "certificate authority will issue HTTPS for a bare IP address."
+    info "A free one takes two minutes at https://www.duckdns.org: create a"
+    info "subdomain, point it at this server's IP, then re-run:"
+    echo
+    info "    DOMAIN=yourname.duckdns.org bash install.sh"
 fi
 echo
 info "The first page you see asks you to create a password. Until you do,"
